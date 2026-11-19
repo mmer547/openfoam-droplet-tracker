@@ -1,0 +1,434 @@
+"""Offline particle tracking on a static, reconstructed OpenFOAM mesh (SI units)."""
+import argparse
+import csv
+import gzip
+import math
+import re
+import os
+from contextlib import contextmanager
+from tempfile import TemporaryDirectory
+from pathlib import Path
+
+import numpy as np
+import vtk
+from vtk.util.numpy_support import numpy_to_vtk, vtk_to_numpy
+
+
+class Flow:
+    def __init__(self, marker):
+        self.reader = vtk.vtkOpenFOAMReader()
+        self.reader.SetFileName(str(marker))
+        self.reader.SkipZeroTimeOff()
+        self.reader.CreateCellToPointOn()
+        self.reader.UpdateInformation()
+        self.reader.DisableAllPatchArrays()
+        self.reader.SetPatchArrayStatus("internalMesh", 1)
+        self.reader.DisableAllCellArrays()
+        self.reader.SetCellArrayStatus("U", 1)
+        values = self.reader.GetTimeValues()
+        if values is None or not values.GetNumberOfValues():
+            raise ValueError("No saved times in case")
+        self.times = vtk_to_numpy(values).copy()
+        self.cache = {}
+
+    def boundary_surfaces(self):
+        self.reader.EnableAllPatchArrays()
+        try:
+            self.reader.UpdateTimeStep(float(self.times[0]))
+            blocks = self.reader.GetOutput().NewIterator()
+            blocks.InitTraversal()
+            patches = {}
+            while not blocks.IsDoneWithTraversal():
+                block = blocks.GetCurrentDataObject()
+                if isinstance(block, vtk.vtkPolyData):
+                    name = blocks.GetCurrentMetaData().Get(vtk.vtkCompositeDataSet.NAME())
+                    patches[name] = triangles(block)
+                blocks.GoToNextItem()
+            return patches
+        finally:
+            self.reader.DisableAllPatchArrays()
+            self.reader.SetPatchArrayStatus("internalMesh", 1)
+
+    def field(self, index):
+        if index not in self.cache:
+            self.reader.UpdateTimeStep(float(self.times[index]))
+            grid = self.reader.GetOutput().GetBlock(0)
+            if not isinstance(grid, vtk.vtkUnstructuredGrid) or not grid.GetPointData().HasArray("U"):
+                raise ValueError(f"Missing internalMesh or U at {self.times[index]}")
+            copy = vtk.vtkUnstructuredGrid()
+            copy.DeepCopy(grid)
+            copy.GetPointData().SetActiveVectors("U")
+            if len(self.cache) >= 2:
+                del self.cache[min(self.cache)]
+            self.cache[index] = copy
+        return self.cache[index]
+
+    def sample(self, t, xyz):
+        points = vtk.vtkPoints()
+        points.SetData(numpy_to_vtk(np.ascontiguousarray(xyz), deep=True))
+        cloud = vtk.vtkPolyData()
+        cloud.SetPoints(points)
+        j = int(np.clip(np.searchsorted(self.times, t), 0, len(self.times)-1))
+        def probe(i):
+            filt = vtk.vtkProbeFilter()
+            filt.SetSourceData(self.field(i))
+            filt.SetInputData(cloud)
+            filt.Update()
+            data = filt.GetOutput().GetPointData()
+            return vtk_to_numpy(data.GetArray("U")).copy(), vtk_to_numpy(data.GetArray("vtkValidPointMask")).astype(bool)
+        if not j or t == self.times[j]:
+            return probe(j)
+        left, valid = probe(j-1)
+        right, other = probe(j)
+        weight = (t-self.times[j-1]) / (self.times[j]-self.times[j-1])
+        return left + weight*(right-left), valid & other
+
+
+def triangles(surface):
+    triangulate = vtk.vtkTriangleFilter()
+    triangulate.SetInputData(surface)
+    triangulate.PassLinesOff()
+    triangulate.PassVertsOff()
+    triangulate.Update()
+    return triangulate.GetOutput()
+
+
+def sample_surface(mesh, count, rng):
+    if not mesh.GetNumberOfPolys():
+        raise ValueError("Patch has no polygon faces")
+    points = vtk_to_numpy(mesh.GetPoints().GetData()).astype(float, copy=False)
+    faces = vtk_to_numpy(mesh.GetPolys().GetConnectivityArray()).reshape(-1, 3)
+    a, b, c = points[faces].transpose(1, 0, 2)
+    ab, ac = b-a, c-a
+    weights = np.linalg.norm(np.cross(ab, ac), axis=1)
+    total = weights.sum()
+    if not np.isfinite(total) or total <= 0:
+        raise ValueError("Patch must have finite, positive surface area")
+    face = rng.choice(len(faces), size=count, p=weights/total)
+    # Reflect the upper half of the unit square into the reference triangle.
+    uv = rng.random((count, 2))
+    upper = uv.sum(axis=1) > 1
+    uv[upper] = 1 - uv[upper]
+    return a[face] + uv[:, :1]*ab[face] + uv[:, 1:]*ac[face]
+
+
+STATUS = {"active": 0, "deposited": 1, "escaped": 2, "boundary": 3, "outside": 4}
+
+
+def wall_names(case):
+    # The boundary dictionary is textual even for binary polyMesh fields.
+    path = case.parent / "constant/polyMesh/boundary"
+    if path.exists():
+        data = path.read_bytes()
+    elif path.with_suffix(".gz").exists():
+        with gzip.open(path.with_suffix(".gz")) as f:
+            data = f.read()
+    else:
+        return set()
+    body = re.sub(r"/\*.*?\*/|//[^\n]*", " ", data.decode("latin1"), flags=re.S)
+    return {name.strip('"') for name, fields in
+            re.findall(r'([^\s(){};]+)\s*\{([^{}]*)\}', body)
+            if re.search(r'(?:^|;)\s*type\s+wall\s*;', fields)}
+
+
+class Boundaries:
+    def __init__(self, patches, walls, outlets):
+        self.names = list(patches)
+        self.status = ["escaped" if name in outlets else
+                       "deposited" if name in walls else "boundary" for name in self.names]
+        append = vtk.vtkAppendPolyData()
+        patch_ids = []
+        for index, mesh in enumerate(patches.values()):
+            if mesh.GetNumberOfPolys():
+                append.AddInputData(mesh)
+                patch_ids.append(np.full(mesh.GetNumberOfPolys(), index))
+        if not patch_ids:
+            raise ValueError("No boundary faces in mesh")
+        append.Update()
+        mesh = append.GetOutput()
+        self.patch_ids = np.concatenate(patch_ids)
+        xyz = vtk_to_numpy(mesh.GetPoints().GetData()).astype(float, copy=False)
+        faces = vtk_to_numpy(mesh.GetPolys().GetConnectivityArray()).reshape(-1, 3)
+        a, b, c = xyz[faces].transpose(1, 0, 2)
+        self.normals = np.cross(b-a, c-a)  # OpenFOAM boundary faces point outwards.
+        self.locator = vtk.vtkStaticCellLocator()
+        self.locator.SetDataSet(mesh)
+        self.locator.BuildLocator()
+
+    def hits(self, start, end):
+        patch = np.full(len(start), -1)
+        fraction = np.full(len(start), np.inf)
+        points = vtk.vtkPoints()
+        points.SetDataTypeToDouble()
+        cells = vtk.vtkIdList()
+        cell = vtk.vtkGenericCell()
+        for i, (p, q) in enumerate(zip(start, end)):
+            if not self.locator.IntersectWithLine(p, q, 0., points, cells, cell):
+                continue
+            direction = q-p
+            length2 = direction @ direction
+            for j in range(cells.GetNumberOfIds()):
+                face = cells.GetId(j)
+                if self.normals[face] @ direction <= 0:
+                    continue
+                u = np.clip((points.GetPoint(j)-p) @ direction / length2, 0., 1.)
+                if u < fraction[i]:
+                    fraction[i] = u
+                    patch[i] = self.patch_ids[face]
+        return patch, fraction
+
+
+@contextmanager
+def trajectory_output(path, names):
+    suffix = path.suffix.lower()
+    if suffix not in (".vtk", ".vtp"):
+        with path.open("x", newline="") as f:
+            out = csv.writer(f)
+            out.writerow(["id", "time", "x", "y", "z", "status", "patch"])
+            def emit(time, coords, labels, status, patch=-1):
+                times = np.broadcast_to(time, (len(labels),))
+                name = names[patch] if patch >= 0 else ""
+                out.writerows((int(i), t, *p, status, name) for i, t, p in zip(labels, times, coords))
+            yield emit
+        return
+
+    if path.exists():
+        raise FileExistsError(path)
+    batches = []
+
+    def record(time, coords, labels, status, patch=-1):
+        if len(labels):
+            batches.append((coords, labels, np.full(len(labels), time, dtype=float),
+                            np.full(len(labels), STATUS[status], dtype=np.uint8),
+                            np.full(len(labels), patch, dtype=np.int32)))
+
+    yield record
+    xyz, ids, times, status, patch_ids = (np.concatenate(parts) for parts in zip(*batches))
+    points = vtk.vtkPoints()
+    points.SetData(numpy_to_vtk(xyz))
+    tracks = vtk.vtkPolyData()
+    tracks.SetPoints(points)
+    # Stable grouping keeps each particle's samples in chronological order.
+    order = np.argsort(ids, kind="stable").astype(np.int64)
+    offsets = np.r_[0, np.cumsum(np.bincount(ids), dtype=np.int64)]
+    lines = vtk.vtkCellArray()
+    lines.SetData(numpy_to_vtk(offsets), numpy_to_vtk(order))
+    tracks.SetLines(lines)
+    for name, values in (("particle_id", ids), ("time", times), ("outside", (status == STATUS["outside"]).astype(np.uint8)),
+                         ("status", status), ("patch_id", patch_ids)):
+        array = numpy_to_vtk(values)
+        array.SetName(name)
+        tracks.GetPointData().AddArray(array)
+
+    for label, strings in (("patch_names", names), ("status_names", list(STATUS))):
+        table = vtk.vtkStringArray()
+        table.SetName(label)
+        for value in strings:
+            table.InsertNextValue(value)
+        tracks.GetFieldData().AddArray(table)
+
+    if suffix == ".vtk":
+        writer = vtk.vtkPolyDataWriter()
+        writer.SetFileTypeToBinary()
+    else:
+        writer = vtk.vtkXMLPolyDataWriter()
+    writer.SetInputData(tracks)
+    with TemporaryDirectory(dir=path.parent) as directory:
+        temporary = Path(directory) / path.name
+        writer.SetFileName(str(temporary))
+        if not writer.Write() or writer.GetErrorCode():
+            raise OSError(f"Failed to write {path}")
+        os.link(temporary, path)
+
+
+def droplet_relaxation(slip, diameter, liquid_density, gas_density, gas_viscosity):
+    """Effective relaxation time for a sphere under Schiller-Naumann drag."""
+    reynolds = gas_density * diameter * np.linalg.norm(slip, axis=1) / gas_viscosity
+    # Cd*Re/24 has a finite limit at zero slip.
+    correction = np.where(reynolds < 1000, 1 + 0.15 * reynolds**0.687,
+                          (0.44 / 24) * reynolds)
+    return (liquid_density * diameter**2 / (18 * gas_viscosity) / correction)[:, None]
+
+
+def relaxation_step(xyz, speed, gas_velocity, tau, gravity, h):
+    """Integrate with gas velocity and drag coefficient frozen over this step."""
+    ratio = h / tau
+    gain = -np.expm1(-ratio)
+    delta = (gas_velocity - speed) + tau * gravity
+    # 1 - gain/ratio suffers cancellation on steps much shorter than tau.
+    drift = 1 - gain / ratio
+    small = ratio < 1e-4
+    if np.any(small):
+        z = ratio[small]
+        drift[small] = z * (0.5 - z / 6 + z**2 / 24)
+    return xyz + h * (speed + drift * delta), speed + gain * delta
+
+
+def write_flow_report(args, start, injected, crossings):
+    width = args.flow_interval or args.dt
+    edges = start + width * np.arange(math.ceil((args.end - start) / width))
+    # Drop a rounded duplicate of the final edge, then include end exactly.
+    edges = np.append(edges[(edges == start) | (edges < np.nextafter(args.end, start))], args.end)
+    if len(edges) < 2 or np.any(np.diff(edges) <= 0):
+        raise ValueError("Flow interval is below time precision")
+    injection = np.zeros(len(edges)-1, dtype=np.int64)
+    injection[0] = injected
+    series = [("injected", args.patch or "", injection)]
+    total = np.zeros_like(injection)
+    for name, batches in crossings.items():
+        times = np.concatenate(batches) if batches else []
+        counts, _ = np.histogram(np.clip(times, start, args.end), bins=edges)
+        series.append(("outlet", name, counts))
+        total += counts
+    series.append(("outlet_total", "", total))
+    volume = math.pi * args.diameter**3 / 6 if args.diameter else None
+    with args.flow_csv.open("x", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["start_s", "end_s", "stream", "patch", "count", "cumulative_count",
+                         "number_per_s", "volume_m3_per_s", "mass_kg_per_s"])
+        for kind, patch, counts in series:
+            cumulative = 0
+            for left, right, count in zip(edges[:-1], edges[1:], counts):
+                cumulative += count
+                rate = count / (right-left)
+                volume_rate = rate * volume if volume is not None else None
+                mass_rate = volume_rate * args.liquid_density if volume_rate is not None else None
+                writer.writerow([left, right, kind, patch, count, cumulative, rate,
+                                 volume_rate, mass_rate])
+
+
+def run(a):
+    flow = Flow(a.case)
+    t = float(flow.times[0]) if a.start is None else a.start
+    if not all(map(math.isfinite, [a.dt, t, a.end, a.tau, *a.gravity])) or a.dt <= 0 or a.tau < 0 or a.end <= t:
+        raise ValueError("Require finite parameters, dt > 0, tau >= 0 and start < end")
+    if len(flow.times) > 1 and (t < flow.times[0] or a.end > flow.times[-1]):
+        raise ValueError("Transient tracking must stay within the saved time range")
+    patches = flow.boundary_surfaces()
+    outlets, walls = set(a.outlet), set(a.wall)
+    requested = walls | outlets | ({a.patch} if a.patch else set())
+    if requested - patches.keys():
+        raise ValueError(f"Unknown patches: {requested - patches.keys()}. Available: {list(patches)}")
+    if walls & outlets:
+        raise ValueError("A patch cannot be both --wall and --outlet")
+    boundaries = Boundaries(patches, walls | wall_names(a.case), outlets)
+    if a.patch:
+        xyz = sample_surface(patches[a.patch], a.count, np.random.default_rng(a.seed))
+    else:
+        with a.seeds.open() as f:
+            rows = list(csv.DictReader(f))
+        xyz = np.array([[float(r[k]) for k in ("x", "y", "z")] for r in rows])
+        if not rows or not np.isfinite(xyz).all():
+            raise ValueError("Provide finite x,y,z seed coordinates")
+    vel, valid = flow.sample(t, xyz)
+    if not valid.all():
+        raise ValueError(f"Seeds outside mesh (zero-based): {np.flatnonzero(~valid)}")
+    droplet = a.diameter is not None
+    inertial = droplet or a.tau > 0
+    gravity = np.asarray(a.gravity)
+    if droplet:
+        gravity = gravity * (1 - a.gas_density / a.liquid_density)
+    speed = vel.copy() if a.initial_velocity is None else np.broadcast_to(a.initial_velocity, vel.shape)
+
+    injected = len(xyz)
+    ids = np.arange(injected)
+    start = t
+    crossings = {name: [] for name in sorted(outlets)}
+    with trajectory_output(a.output, boundaries.names) as emit:
+        emit(t, xyz, ids, "active")
+        while t < a.end and len(ids):
+            end = min(a.end, t+a.dt)
+            if end <= t:
+                raise ValueError("dt is below time precision")
+            h = end-t
+            if inertial:
+                tau = (droplet_relaxation(vel - speed, a.diameter, a.liquid_density,
+                                          a.gas_density, a.gas_viscosity)
+                       if droplet else np.asarray([[a.tau]]))
+                trial, speed = relaxation_step(xyz, speed, vel, tau, gravity, h)
+            else:
+                trial = xyz + h*vel
+            patch, fraction = boundaries.hits(xyz, trial)
+            for index in np.unique(patch[patch >= 0]):
+                hit = patch == index
+                u = fraction[hit]
+                pos = xyz[hit] + u[:, None]*(trial[hit]-xyz[hit])
+                hit_times = t + h*u
+                emit(hit_times, pos, ids[hit], boundaries.status[index], index)
+                if a.flow_csv and boundaries.status[index] == "escaped":
+                    crossings[boundaries.names[index]].append(hit_times)
+            remaining = patch < 0
+            if not remaining.any():
+                break
+            trial, ids = trial[remaining], ids[remaining]
+            if inertial:
+                speed = speed[remaining]
+            sampled, ok = flow.sample(end, trial)
+            emit(end, trial[~ok], ids[~ok], "outside")
+            xyz, vel, ids = trial[ok], sampled[ok], ids[ok]
+            if inertial:
+                speed = speed[ok]
+            emit(end, xyz, ids, "active")
+            t = end
+    if a.flow_csv:
+        write_flow_report(a, start, injected, crossings)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("case", type=Path, help="empty .foam marker in case directory")
+    parser.add_argument("seeds", nargs="?", type=Path, help="CSV with x,y,z columns")
+    parser.add_argument("output", type=Path, help="new trajectory file (.csv, .vtk or .vtp)")
+    parser.add_argument("--start", type=float)
+    parser.add_argument("--end", required=True, type=float)
+    parser.add_argument("--dt", required=True, type=float)
+    model = parser.add_mutually_exclusive_group()
+    model.add_argument("--diameter", type=float, help="enable spherical droplet drag, diameter in m")
+    model.add_argument("--tau", type=float, default=0, help="Stokes relaxation time in seconds")
+    parser.add_argument("--gravity", nargs=3, type=float, help="gravity in m/s^2 (droplets default to 0 0 -9.81, --tau to zero)")
+    parser.add_argument("--liquid-density", type=float, help="droplet density in kg/m^3 (default 998.2)")
+    parser.add_argument("--gas-density", type=float, help="gas density in kg/m^3 (default 1.204)")
+    parser.add_argument("--gas-viscosity", type=float, help="gas dynamic viscosity in Pa s (default 1.81e-5)")
+    parser.add_argument("--initial-velocity", nargs=3, type=float, help="injection velocity in m/s (default local U)")
+    parser.add_argument("--patch", help="OpenFOAM boundary patch for a single release at start")
+    parser.add_argument("--count", type=int, help="number of particles released on the patch")
+    parser.add_argument("--seed", type=int, help="nonnegative random seed for reproducible positions")
+    parser.add_argument("--outlet", action="append", default=[], metavar="NAME",
+                        help="classify hits on this patch as escaped (repeatable)")
+    parser.add_argument("--wall", action="append", default=[], metavar="NAME",
+                        help="additional sticking wall (type wall is detected automatically, repeatable)")
+    parser.add_argument("--flow-csv", type=Path, help="new CSV for injected and outlet particle rates")
+    parser.add_argument("--flow-interval", type=float, help="flow averaging interval in seconds (default: dt)")
+    args = parser.parse_args()
+    if args.flow_interval is not None and (not args.flow_csv or not math.isfinite(args.flow_interval)
+                                           or args.flow_interval <= 0):
+        parser.error("--flow-interval requires --flow-csv and a finite, positive width")
+    if args.flow_csv and (args.flow_csv.exists() or args.flow_csv.resolve() == args.output.resolve()):
+        parser.error("--flow-csv requires a new file distinct from the trajectory output")
+    if bool(args.patch) == bool(args.seeds):
+        parser.error("provide either a seed CSV or --patch NAME")
+    if args.patch and (args.count is None or args.count < 1):
+        parser.error("--patch requires a positive --count")
+    if not args.patch and (args.count is not None or args.seed is not None):
+        parser.error("--count and --seed require --patch")
+    if args.seed is not None and args.seed < 0:
+        parser.error("--seed must be nonnegative")
+    if args.diameter is not None:
+        if not math.isfinite(args.diameter) or args.diameter <= 0:
+            parser.error("--diameter must be finite and positive")
+        for key, default in (("liquid_density", 998.2), ("gas_density", 1.204), ("gas_viscosity", 1.81e-5)):
+            value = getattr(args, key)
+            if value is None:
+                setattr(args, key, default)
+            elif not math.isfinite(value) or value <= 0:
+                parser.error(f"--{key.replace('_', '-')} must be finite and positive")
+    elif any(x is not None for x in (args.liquid_density, args.gas_density, args.gas_viscosity)):
+        parser.error("droplet material properties require --diameter")
+    if args.initial_velocity is not None:
+        if args.diameter is None and args.tau <= 0:
+            parser.error("--initial-velocity requires --diameter or positive --tau")
+        if not np.isfinite(args.initial_velocity).all():
+            parser.error("--initial-velocity components must be finite")
+    if args.gravity is None:
+        args.gravity = (0, 0, -9.81) if args.diameter is not None else (0, 0, 0)
+    run(args)
