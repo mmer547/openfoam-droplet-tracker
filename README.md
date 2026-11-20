@@ -117,7 +117,7 @@ python /workspace/track_particles.py case.foam flow.csv --flow-only \
 
 どちらのモードも液滴の積分、境界判定、出口通過時刻の計算は毎ステップ行います。`--flow-interval` は流量 CSV の集計幅です。
 
-## 分離器で一定時間投入し、その後も追跡する
+## 投入停止後の粒子を追跡する
 
 次の例は 0 s から 2 s の間に合計 10,000 個（平均 5,000 個/s）を投入し、10 s まで追跡します。保存済みの非定常場を使う場合は、追跡終了までの流速場が必要です。出口名は実ケースのパッチ名に置き換えます。
 
@@ -125,10 +125,10 @@ python /workspace/track_particles.py case.foam flow.csv --flow-only \
 python /workspace/track_particles.py case.foam tracks.vtp \
   --patch inlet --count 10000 --seed 42 --diameter 1e-4 \
   --start 0 --injection-duration 2 --end 10 --dt 0.001 \
-  --outlet drain --outlet gasOutlet --track-interval 0.05 \
+  --outlet outletA --outlet outletB --track-interval 0.05 \
   --flow-csv flow.csv --flow-interval 0.1
 ```
 
 総数 N、投入時間 T に対し、粒子 ID i の投入時刻は `start + i × T / N`（i = 0 … N−1）です。非定常場では各投入時刻の流速を補間し、途中で投入した粒子はそのステップの残り時間だけ進めます。CSV で位置を指定した場合は行順で投入します。T の既定値は 0（一括投入）です。時間指定は流量のみのモードにも適用できます。
 
-回収口が `drain` なら、終了区間の流量 CSV で `outlet,drain` の累積個数を `injected` の累積個数で割ると、その時刻までの個数基準の回収効率になります。単一径・一定密度の本モデルでは質量基準でも同じ値です。壁に付着した液滴も回収とみなす場合は、該当する壁の付着数を分子に加えます。時間指定投入の実行後には、投入総数・装置内残留数（active）・状態別の終了数を表示します。残留が多い場合は追跡終了時刻を延ばして効率の変化を確認できます。
+終了区間の流量 CSV で、対象パッチ（例では `outletA`）の累積通過個数を `injected` の累積個数で割ると、その時刻までにその出口を通過した粒子の割合が得られます。時間指定投入の実行後には、投入総数、領域内に残った粒子数（`active`）、状態別の終了数を表示します。
