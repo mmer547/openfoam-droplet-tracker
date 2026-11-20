@@ -84,6 +84,23 @@ class Flow:
         return left + weight*(right-left), valid & other
 
 
+    def sample_release(self, times, xyz):
+        """Sample a batch at individual release times using the bracketing fields."""
+        if times[0] == times[-1] or len(self.times) == 1:
+            return self.sample(times[0], xyz)
+        right = np.clip(np.searchsorted(self.times, times), 1, len(self.times)-1)
+        velocity = np.empty_like(xyz)
+        valid = np.empty(len(times), dtype=bool)
+        for j in np.unique(right):
+            selected = right == j
+            left, left_ok = self.sample(self.times[j-1], xyz[selected])
+            upper, upper_ok = self.sample(self.times[j], xyz[selected])
+            weight = (times[selected] - self.times[j-1]) / (self.times[j] - self.times[j-1])
+            velocity[selected] = left + weight[:, None]*(upper-left)
+            valid[selected] = left_ok & upper_ok
+        return velocity, valid
+
+
 def triangles(surface):
     triangulate = vtk.vtkTriangleFilter()
     triangulate.SetInputData(surface)
@@ -302,15 +319,14 @@ def relaxation_step(xyz, speed, gas_velocity, tau, gravity, h):
     return xyz + h * (speed + drift * delta), speed + gain * delta
 
 
-def write_flow_report(args, start, injected, crossings):
+def write_flow_report(args, start, release_times, crossings):
     width = args.flow_interval or args.dt
     edges = start + width * np.arange(math.ceil((args.end - start) / width))
     # Drop a rounded duplicate of the final edge, then include end exactly.
     edges = np.append(edges[(edges == start) | (edges < np.nextafter(args.end, start))], args.end)
     if len(edges) < 2 or np.any(np.diff(edges) <= 0):
         raise ValueError("Flow interval is below time precision")
-    injection = np.zeros(len(edges)-1, dtype=np.int64)
-    injection[0] = injected
+    injection, _ = np.histogram(release_times, bins=edges)
     series = [("injected", args.patch or "", injection)]
     total = np.zeros_like(injection)
     for name, batches in crossings.items():
@@ -358,30 +374,59 @@ def run(a):
         xyz = np.array([[float(r[k]) for k in ("x", "y", "z")] for r in rows])
         if not rows or not np.isfinite(xyz).all():
             raise ValueError("Provide finite x,y,z seed coordinates")
-    vel, valid = flow.sample(t, xyz)
-    if not valid.all():
-        raise ValueError(f"Seeds outside mesh (zero-based): {np.flatnonzero(~valid)}")
+    seeds = xyz
+    start = t
+    duration = a.injection_duration
+    if not math.isfinite(duration) or duration < 0 or duration > a.end-start + math.ulp(a.end):
+        raise ValueError("Injection duration must fit between start and end")
+    # Each ID represents one droplet released at the beginning of an equal time slot.
+    release_times = start + duration * (np.arange(len(seeds)) / len(seeds))
+    if release_times[-1] >= a.end:
+        raise ValueError("Release schedule exceeds available time precision")
+    pending = 0
+    ids = np.empty(0, dtype=np.intp)
+    xyz = seeds[:0]
+    vel = speed = xyz
     droplet = a.diameter is not None
     inertial = droplet or a.tau > 0
     gravity = np.asarray(a.gravity)
     if droplet:
         gravity = gravity * (1 - a.gas_density / a.liquid_density)
-    speed = vel.copy() if a.initial_velocity is None else np.broadcast_to(a.initial_velocity, vel.shape)
-
-    injected = len(xyz)
-    ids = np.arange(injected)
-    start = t
+    finalized = dict.fromkeys(("deposited", "escaped", "boundary", "outside"), 0)
     crossings = {name: [] for name in sorted(outlets)}
     with trajectory_output(a.output, boundaries.names) as emit:
-        if emit:
-            emit(t, xyz, ids, "active")
         step = 0
         last_bin = 0
-        while t < a.end and len(ids):
+        while t < a.end and (len(ids) or pending < len(seeds)):
             end = min(a.end, t+a.dt)
             if end <= t:
                 raise ValueError("dt is below time precision")
             h = end-t
+            stop = np.searchsorted(release_times, end, side="left") if pending < len(seeds) else pending
+            step_start = None
+            if stop > pending:
+                born = np.arange(pending, stop)
+                birth = release_times[pending:stop]
+                positions = seeds[pending:stop]
+                initial, valid = flow.sample_release(birth, positions)
+                if not valid.all():
+                    raise ValueError(f"Seeds outside mesh (zero-based): {born[~valid]}")
+                if emit:
+                    emit(birth, positions, born, "active")
+                if birth[-1] > t:
+                    step_start = np.concatenate((np.full(len(ids), t), birth))
+                    h = (end-step_start)[:, None]
+                xyz = np.concatenate((xyz, positions)) if len(ids) else positions
+                vel = np.concatenate((vel, initial)) if len(ids) else initial
+                if inertial:
+                    initial_speed = initial if a.initial_velocity is None else np.broadcast_to(a.initial_velocity, initial.shape)
+                    speed = np.concatenate((speed, initial_speed)) if len(ids) else initial_speed
+                ids = np.concatenate((ids, born))
+                pending = stop
+            if not len(ids):
+                t = end
+                step += 1
+                continue
             if inertial:
                 tau = (droplet_relaxation(vel - speed, a.diameter, a.liquid_density,
                                           a.gas_density, a.gas_viscosity)
@@ -393,19 +438,20 @@ def run(a):
             for index in np.unique(patch[patch >= 0]):
                 hit = patch == index
                 u = fraction[hit]
-                hit_times = t + h*u
+                finalized[boundaries.status[index]] += len(u)
+                hit_times = (t + h*u if step_start is None else
+                             step_start[hit] + h[hit, 0]*u)
                 if emit:
                     pos = xyz[hit] + u[:, None]*(trial[hit]-xyz[hit])
                     emit(hit_times, pos, ids[hit], boundaries.status[index], index)
                 if a.flow_csv and boundaries.status[index] == "escaped":
                     crossings[boundaries.names[index]].append(hit_times)
             remaining = patch < 0
-            if not remaining.any():
-                break
             trial, ids = trial[remaining], ids[remaining]
             if inertial:
                 speed = speed[remaining]
-            sampled, ok = flow.sample(end, trial)
+            sampled, ok = flow.sample(end, trial) if len(ids) else (trial, np.empty(0, dtype=bool))
+            finalized["outside"] += len(ok) - np.count_nonzero(ok)
             if emit:
                 emit(end, trial[~ok], ids[~ok], "outside")
             xyz, vel, ids = trial[ok], sampled[ok], ids[ok]
@@ -422,7 +468,9 @@ def run(a):
                 last_bin = current_bin
             t = end
     if a.flow_csv:
-        write_flow_report(a, start, injected, crossings)
+        write_flow_report(a, start, release_times, crossings)
+    if duration:
+        print(f"injected={pending} active={len(ids)}", *(f"{k}={v}" for k, v in finalized.items()))
 
 
 if __name__ == "__main__":
@@ -441,7 +489,9 @@ if __name__ == "__main__":
     parser.add_argument("--gas-density", type=float, help="gas density in kg/m^3 (default 1.204)")
     parser.add_argument("--gas-viscosity", type=float, help="gas dynamic viscosity in Pa s (default 1.81e-5)")
     parser.add_argument("--initial-velocity", nargs=3, type=float, help="injection velocity in m/s (default local U)")
-    parser.add_argument("--patch", help="OpenFOAM boundary patch for a single release at start")
+    parser.add_argument("--patch", help="OpenFOAM boundary patch for particle injection")
+    parser.add_argument("--injection-duration", type=float, default=0, metavar="SECONDS",
+                        help="release all particles uniformly over this duration from start (default: instantaneous)")
     parser.add_argument("--count", type=int, help="number of particles released on the patch")
     parser.add_argument("--seed", type=int, help="nonnegative random seed for reproducible positions")
     parser.add_argument("--outlet", action="append", default=[], metavar="NAME",
