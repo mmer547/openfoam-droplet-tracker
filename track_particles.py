@@ -131,6 +131,39 @@ def wall_names(case):
             if re.search(r'(?:^|;)\s*type\s+wall\s*;', fields)}
 
 
+class BoundaryGrid:
+    """Conservative broad phase for batched short segments on a static mesh."""
+
+    def __init__(self, a, b, c):
+        lower = np.minimum(np.minimum(a, b), c)
+        upper = np.maximum(np.maximum(a, b), c)
+        self.origin = lower.min(axis=0)
+        extent = upper.max(axis=0) - self.origin
+        self.size = 64
+        self.scale = np.divide(self.size, extent, out=np.zeros(3), where=extent > 0)
+        lo = self.bins(lower)
+        hi = self.bins(upper) + 1
+        # Range additions mark every bin overlapped by each triangle's bounding box.
+        n = self.size + 1
+        counts = np.zeros((n, n, n), dtype=np.int64)
+        for x in (0, 1):
+            for y in (0, 1):
+                for z in (0, 1):
+                    bounds = (lo, hi)
+                    corner = (bounds[x][:, 0], bounds[y][:, 1], bounds[z][:, 2])
+                    np.add.at(counts, corner, (-1)**(x+y+z))
+        self.occupied = counts.cumsum(0).cumsum(1).cumsum(2)[:-1, :-1, :-1] > 0
+
+    def bins(self, xyz):
+        return np.clip((xyz - self.origin) * self.scale, 0, self.size-1).astype(np.intp)
+
+    def candidates(self, start, end):
+        first = self.bins(start)
+        last = self.bins(end)
+        # A segment whose endpoints share an empty bin cannot intersect a face.
+        return np.flatnonzero(self.occupied[tuple(first.T)] | np.any(first != last, axis=1))
+
+
 class Boundaries:
     def __init__(self, patches, walls, outlets):
         self.names = list(patches)
@@ -150,6 +183,7 @@ class Boundaries:
         xyz = vtk_to_numpy(mesh.GetPoints().GetData()).astype(float, copy=False)
         faces = vtk_to_numpy(mesh.GetPolys().GetConnectivityArray()).reshape(-1, 3)
         a, b, c = xyz[faces].transpose(1, 0, 2)
+        self.grid = BoundaryGrid(a, b, c)
         self.normals = np.cross(b-a, c-a)  # OpenFOAM boundary faces point outwards.
         self.locator = vtk.vtkStaticCellLocator()
         self.locator.SetDataSet(mesh)
@@ -162,7 +196,8 @@ class Boundaries:
         points.SetDataTypeToDouble()
         cells = vtk.vtkIdList()
         cell = vtk.vtkGenericCell()
-        for i, (p, q) in enumerate(zip(start, end)):
+        for i in self.grid.candidates(start, end):
+            p, q = start[i], end[i]
             if not self.locator.IntersectWithLine(p, q, 0., points, cells, cell):
                 continue
             direction = q-p
