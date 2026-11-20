@@ -2,6 +2,27 @@
 
 [track_particles.py](./track_particles.py) は、OpenFOAM で保存した気体速度場 `U` を読み、個々の液滴の位置と速度を時間積分する Python スクリプトです。同じ流れ場を使って液滴径や投入位置を変え、出口への到達時間や壁への付着率を比較できます。静止した再構築済みメッシュを使い、液滴から気体への運動量のフィードバックを無視できる希薄な条件を想定します。
 
+## 入力ファイルで実行する
+
+[分離器の入力例 separator.toml](./separator.toml) をケースディレクトリにコピーし、入口・出口のパッチ名と保存済みの時間範囲を実ケースに合わせます。スクリプトの引数はファイル 1 つです。
+
+```bash
+python /workspace/track_particles.py --config separator.toml
+```
+
+入力例では合計 10,000 個の水滴を最初の 2 秒間に投入し、10 秒まで追跡します。相対パスは TOML のあるディレクトリを基準に解決します。Python 3.11 以降は標準ライブラリで読み込めます。それ以前の環境では `python -m pip install tomli` が必要です。
+
+| セクション | 設定項目 |
+|---|---|
+| `[files]` | `case`, `output`, `flow_csv`, `seeds`（初期位置 CSV） |
+| `[time]` | `start`, `end`, `dt`（秒） |
+| `[injection]` | `patch`, `count`, `seed`, `injection_duration`, `initial_velocity` |
+| `[particle]` | `diameter`, `tau`, `gravity`, `liquid_density`, `gas_density`, `gas_viscosity` |
+| `[boundary]` | `outlet`, `wall`（パッチ名を配列で指定） |
+| `[report]` | `track_interval`, `flow_interval`, `flow_only` |
+
+ファイル方式では条件を TOML にまとめます。省略時の既定値と物理量の単位は以下の CLI 方式と共通です。流量だけを出すには、入力例の `[report]` に `flow_only = true` を追加し、`[files]` の `output` を `"flow.csv"` に変更して、`flow_csv` と `track_interval` の行を削除します。初期位置 CSV を使う場合は `files.seeds` を指定し、`injection.patch`、`count`、`seed` を省きます。
+
 ## 100 µm の水滴を 10,000 個投入する
 
 Python 環境に `python -m pip install numpy vtk` で依存ライブラリを入れます。ケースディレクトリで次を実行します。例は z 軸上向き、開始時刻 0 s、終了時刻 1 s です。パッチ名は実ケースの `constant/polyMesh/boundary` に合わせます。
