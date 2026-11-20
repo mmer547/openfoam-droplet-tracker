@@ -1,0 +1,32 @@
+# ケースディレクトリにコピーし、パッチ名と保存済みの時間範囲を合わせてください。
+[files]
+case = "case.foam"
+output = "tracks.vtp"
+flow_csv = "flow.csv"
+
+[time]
+start = 0
+end = 10
+dt = 0.001
+
+[injection]
+patch = "inlet"
+count = 10000
+seed = 42
+injection_duration = 2.0  # s。投入終了後も time.end まで追跡
+# initial_velocity = [1, 0, 0]  # m/s。省略時は局所気体速度
+
+[particle]
+diameter = 1.0e-4  # m（100 µm）
+gravity = [0, 0, -9.81]
+# liquid_density = 998.2  # kg/m³
+# gas_density = 1.204     # kg/m³
+# gas_viscosity = 1.81e-5 # Pa·s
+
+[boundary]
+outlet = ["outletA", "outletB"]
+# wall = ["wallA"]
+
+[report]
+track_interval = 0.05
+flow_interval = 0.1

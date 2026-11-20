@@ -1,5 +1,6 @@
 """Offline particle tracking on a static, reconstructed OpenFOAM mesh (SI units)."""
 import argparse
+import sys
 import csv
 import gzip
 import math
@@ -473,6 +474,71 @@ def run(a):
         print(f"injected={pending} active={len(ids)}", *(f"{k}={v}" for k, v in finalized.items()))
 
 
+def config_arguments(path):
+    """Translate a TOML run specification into the existing solver arguments."""
+    try:
+        import tomllib
+    except ImportError:
+        try:
+            import tomli as tomllib
+        except ImportError as exc:
+            raise ValueError("TOML input requires Python 3.11+ or pip install tomli") from exc
+    with path.open("rb") as stream:
+        config = tomllib.load(stream)
+    sections = {
+        "files": {"case", "seeds", "output", "flow_csv"},
+        "time": {"start", "end", "dt"},
+        "injection": {"patch", "count", "seed", "injection_duration", "initial_velocity"},
+        "particle": {"diameter", "tau", "gravity", "liquid_density", "gas_density", "gas_viscosity"},
+        "boundary": {"outlet", "wall"},
+        "report": {"track_interval", "flow_interval", "flow_only"},
+    }
+    positional = {}
+    options = []
+    for section, entries in config.items():
+        if section not in sections or not isinstance(entries, dict):
+            raise ValueError(f"Unknown or invalid TOML section: {section}")
+        for key, value in entries.items():
+            field = f"{section}.{key}"
+            if key not in sections[section]:
+                raise ValueError(f"Unknown TOML key: {field}")
+            option = "--" + key.replace("_", "-")
+            if section == "files" or key == "patch":
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"{field} requires a nonempty string")
+                if section == "files":
+                    value = str((path.parent / value).absolute())
+                if key in ("case", "seeds", "output"):
+                    positional[key] = value
+                else:
+                    options.append(f"{option}={value}")
+            elif key in ("outlet", "wall"):
+                if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
+                    raise ValueError(f"{field} requires an array of patch names")
+                options.extend(f"{option}={v}" for v in value)
+            elif key in ("gravity", "initial_velocity"):
+                if not isinstance(value, list) or len(value) != 3 or not all(type(v) in (int, float) and math.isfinite(v) for v in value):
+                    raise ValueError(f"{field} requires three finite numbers")
+                # argparse can mistake a negative exponent-form number for an option.
+                options.append(option)
+                options.extend(np.format_float_positional(v, trim="-") if isinstance(v, float)
+                               else str(v) for v in value)
+            elif key == "flow_only":
+                if type(value) is not bool:
+                    raise ValueError(f"{field} requires true or false")
+                if value:
+                    options.append(option)
+            else:
+                types = (int,) if key in ("count", "seed") else (int, float)
+                if type(value) not in types:
+                    raise ValueError(f"Invalid numeric type for {field}")
+                options.append(f"{option}={value}")
+    for key in ("case", "output"):
+        if key not in positional:
+            raise ValueError(f"Missing TOML key: files.{key}")
+    return [positional[k] for k in ("case", "seeds", "output") if k in positional] + options
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("case", type=Path, help="empty .foam marker in case directory")
@@ -502,7 +568,19 @@ if __name__ == "__main__":
     parser.add_argument("--flow-only", action="store_true", help="use the positional output for the flow CSV only")
     parser.add_argument("--flow-csv", type=Path, help="new CSV for injected and outlet particle rates")
     parser.add_argument("--flow-interval", type=float, help="flow averaging interval in seconds (default: dt)")
-    args = parser.parse_args()
+    config_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    config_parser.add_argument("--config", type=Path, metavar="FILE")
+    parser.epilog = "Alternatively, run with --config FILE to load a TOML input file."
+    config_option, remaining = config_parser.parse_known_args()
+    argv = sys.argv[1:]
+    if config_option.config is not None:
+        if remaining:
+            parser.error("--config FILE is a complete run specification; use it by itself")
+        try:
+            argv = config_arguments(config_option.config)
+        except (OSError, ValueError) as exc:
+            parser.error(f"{config_option.config}: {exc}")
+    args = parser.parse_args(argv)
     if args.flow_only:
         if args.flow_csv or args.track_interval is not None:
             parser.error("--flow-only uses the positional output and excludes --flow-csv and --track-interval")
