@@ -519,7 +519,10 @@ def config_arguments(path):
             elif key in ("gravity", "initial_velocity"):
                 if not isinstance(value, list) or len(value) != 3 or not all(type(v) in (int, float) and math.isfinite(v) for v in value):
                     raise ValueError(f"{field} requires three finite numbers")
-                options.extend([option, *map(str, value)])
+                # argparse can mistake a negative exponent-form number for an option.
+                options.append(option)
+                options.extend(np.format_float_positional(v, trim="-") if isinstance(v, float)
+                               else str(v) for v in value)
             elif key == "flow_only":
                 if type(value) is not bool:
                     raise ValueError(f"{field} requires true or false")
