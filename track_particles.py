@@ -180,6 +180,9 @@ class Boundaries:
 
 @contextmanager
 def trajectory_output(path, names):
+    if path is None:
+        yield None
+        return
     suffix = path.suffix.lower()
     if suffix not in (".vtk", ".vtp"):
         with path.open("x", newline="") as f:
@@ -335,7 +338,10 @@ def run(a):
     start = t
     crossings = {name: [] for name in sorted(outlets)}
     with trajectory_output(a.output, boundaries.names) as emit:
-        emit(t, xyz, ids, "active")
+        if emit:
+            emit(t, xyz, ids, "active")
+        step = 0
+        last_bin = 0
         while t < a.end and len(ids):
             end = min(a.end, t+a.dt)
             if end <= t:
@@ -352,9 +358,10 @@ def run(a):
             for index in np.unique(patch[patch >= 0]):
                 hit = patch == index
                 u = fraction[hit]
-                pos = xyz[hit] + u[:, None]*(trial[hit]-xyz[hit])
                 hit_times = t + h*u
-                emit(hit_times, pos, ids[hit], boundaries.status[index], index)
+                if emit:
+                    pos = xyz[hit] + u[:, None]*(trial[hit]-xyz[hit])
+                    emit(hit_times, pos, ids[hit], boundaries.status[index], index)
                 if a.flow_csv and boundaries.status[index] == "escaped":
                     crossings[boundaries.names[index]].append(hit_times)
             remaining = patch < 0
@@ -364,11 +371,20 @@ def run(a):
             if inertial:
                 speed = speed[remaining]
             sampled, ok = flow.sample(end, trial)
-            emit(end, trial[~ok], ids[~ok], "outside")
+            if emit:
+                emit(end, trial[~ok], ids[~ok], "outside")
             xyz, vel, ids = trial[ok], sampled[ok], ids[ok]
             if inertial:
                 speed = speed[ok]
-            emit(end, xyz, ids, "active")
+            step += 1
+            if emit:
+                # Use the step index to avoid accumulating rounding error in the save schedule.
+                current_bin = step
+                if a.track_interval and a.track_interval > a.dt:
+                    current_bin = math.floor(math.nextafter(step*a.dt/a.track_interval, math.inf))
+                if current_bin > last_bin or end == a.end:
+                    emit(end, xyz, ids, "active")
+                last_bin = current_bin
             t = end
     if a.flow_csv:
         write_flow_report(a, start, injected, crossings)
@@ -378,7 +394,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("case", type=Path, help="empty .foam marker in case directory")
     parser.add_argument("seeds", nargs="?", type=Path, help="CSV with x,y,z columns")
-    parser.add_argument("output", type=Path, help="new trajectory file (.csv, .vtk or .vtp)")
+    parser.add_argument("output", type=Path, help="trajectory file (.csv, .vtk or .vtp), or flow CSV with --flow-only")
     parser.add_argument("--start", type=float)
     parser.add_argument("--end", required=True, type=float)
     parser.add_argument("--dt", required=True, type=float)
@@ -397,13 +413,21 @@ if __name__ == "__main__":
                         help="classify hits on this patch as escaped (repeatable)")
     parser.add_argument("--wall", action="append", default=[], metavar="NAME",
                         help="additional sticking wall (type wall is detected automatically, repeatable)")
+    parser.add_argument("--track-interval", type=float, help="trajectory sampling interval in seconds")
+    parser.add_argument("--flow-only", action="store_true", help="use the positional output for the flow CSV only")
     parser.add_argument("--flow-csv", type=Path, help="new CSV for injected and outlet particle rates")
     parser.add_argument("--flow-interval", type=float, help="flow averaging interval in seconds (default: dt)")
     args = parser.parse_args()
+    if args.flow_only:
+        if args.flow_csv or args.track_interval is not None:
+            parser.error("--flow-only uses the positional output and excludes --flow-csv and --track-interval")
+        args.flow_csv, args.output = args.output, None
+    if args.track_interval is not None and (not math.isfinite(args.track_interval) or args.track_interval <= 0):
+        parser.error("--track-interval must be finite and positive")
     if args.flow_interval is not None and (not args.flow_csv or not math.isfinite(args.flow_interval)
                                            or args.flow_interval <= 0):
         parser.error("--flow-interval requires --flow-csv and a finite, positive width")
-    if args.flow_csv and (args.flow_csv.exists() or args.flow_csv.resolve() == args.output.resolve()):
+    if args.flow_csv and (args.flow_csv.exists() or (args.output and args.flow_csv.resolve() == args.output.resolve())):
         parser.error("--flow-csv requires a new file distinct from the trajectory output")
     if bool(args.patch) == bool(args.seeds):
         parser.error("provide either a seed CSV or --patch NAME")
