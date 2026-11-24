@@ -26,6 +26,7 @@ gravity = [0, 0, -9.81]
 [boundary]
 outlet = ["outletA", "outletB"]
 # wall = ["wallA"]
+# rebound = { wallB = { e = 0.5, mu = 0.2 } }
 
 [report]
 track_interval = 0.05

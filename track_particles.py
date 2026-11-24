@@ -87,7 +87,7 @@ class Flow:
 
     def sample_release(self, times, xyz):
         """Sample a batch at individual release times using the bracketing fields."""
-        if times[0] == times[-1] or len(self.times) == 1:
+        if np.all(times == times[0]) or len(self.times) == 1:
             return self.sample(times[0], xyz)
         right = np.clip(np.searchsorted(self.times, times), 1, len(self.times)-1)
         velocity = np.empty_like(xyz)
@@ -130,7 +130,7 @@ def sample_surface(mesh, count, rng):
     return a[face] + uv[:, :1]*ab[face] + uv[:, 1:]*ac[face]
 
 
-STATUS = {"active": 0, "deposited": 1, "escaped": 2, "boundary": 3, "outside": 4}
+STATUS = {"active": 0, "deposited": 1, "escaped": 2, "boundary": 3, "outside": 4, "rebounded": 5}
 
 
 def wall_names(case):
@@ -208,7 +208,7 @@ class Boundaries:
         self.locator.BuildLocator()
 
     def hits(self, start, end):
-        patch = np.full(len(start), -1)
+        faces = np.full(len(start), -1)
         fraction = np.full(len(start), np.inf)
         points = vtk.vtkPoints()
         points.SetDataTypeToDouble()
@@ -227,8 +227,8 @@ class Boundaries:
                 u = np.clip((points.GetPoint(j)-p) @ direction / length2, 0., 1.)
                 if u < fraction[i]:
                     fraction[i] = u
-                    patch[i] = self.patch_ids[face]
-        return patch, fraction
+                    faces[i] = face
+        return faces, fraction
 
 
 @contextmanager
@@ -320,6 +320,75 @@ def relaxation_step(xyz, speed, gas_velocity, tau, gravity, h):
     return xyz + h * (speed + drift * delta), speed + gain * delta
 
 
+def reflect_velocity(velocity, normals, e, mu):
+    normal_speed = np.sum(velocity * normals, axis=1, keepdims=True)
+    tangent = velocity - normal_speed * normals
+    return velocity - (1 + e)*np.maximum(normal_speed, 0)*normals - mu*tangent
+
+
+def advance_particles(a, flow, boundaries, ids, xyz, vel, speed, starts, end,
+                      gravity, emit, counts, crossings):
+    """Finish one global step, batching only rebounding particles on later passes."""
+    inertial = a.diameter is not None or a.tau > 0
+    live = np.ones(len(ids), dtype=bool)
+    positions = np.empty_like(xyz)
+    velocities = np.empty_like(xyz) if inertial else speed
+    batch = np.arange(len(ids))
+    # Guard against unresolved persistent contact and pathological substep counts.
+    for _ in range(128):
+        h = (end-starts)[:, None]
+        if inertial:
+            tau = (droplet_relaxation(vel-speed, a.diameter, a.liquid_density,
+                                      a.gas_density, a.gas_viscosity)
+                   if a.diameter is not None else np.full((len(batch), 1), a.tau))
+            trial, next_speed = relaxation_step(xyz, speed, vel, tau, gravity, h)
+            velocities[batch] = next_speed
+        else:
+            trial = xyz + h*vel
+        positions[batch] = trial
+        faces, fractions = boundaries.hits(xyz, trial)
+        collided = np.flatnonzero(faces >= 0)
+        patch_ids = boundaries.patch_ids[faces[collided]]
+        continuing = []
+        impact_times = []
+        for index in np.unique(patch_ids):
+            hit = collided[patch_ids == index]
+            slots = batch[hit]
+            elapsed = fractions[hit, None]*h[hit]
+            times = np.minimum(end, starts[hit] + elapsed[:, 0])
+            contact = xyz[hit] + fractions[hit, None]*(trial[hit]-xyz[hit])
+            name = boundaries.names[index]
+            status = boundaries.status[index]
+            if name in a.rebounds:
+                status = "rebounded"
+                normals = boundaries.normals[faces[hit]]
+                normals = normals / np.linalg.norm(normals, axis=1, keepdims=True)
+                # Use velocity at impact under the same frozen drag law as the trial.
+                gain = -np.expm1(-elapsed/tau[hit])
+                impact_speed = speed[hit] + gain*((vel[hit]-speed[hit]) + tau[hit]*gravity)
+                velocities[slots] = reflect_velocity(impact_speed, normals, *a.rebounds[name])
+                positions[slots] = contact
+                more = times < end
+                continuing.append(slots[more])
+                impact_times.append(times[more])
+            else:
+                live[slots] = False
+            counts[status] += len(slots)
+            if emit:
+                emit(times, contact, ids[slots], status, index)
+            if a.flow_csv and status == "escaped":
+                crossings[name].append(times)
+        if not continuing or not any(len(group) for group in continuing):
+            return positions[live], ids[live], velocities[live] if inertial else speed
+        batch = np.concatenate(continuing)
+        starts = np.concatenate(impact_times)
+        xyz, speed = positions[batch], velocities[batch]
+        vel, ok = flow.sample_release(starts, xyz)
+        if not ok.all():
+            raise ValueError(f"Cannot sample flow at wall impact for particles {ids[batch[~ok]]}")
+    raise ValueError("Unresolved repeated wall impacts within a step; reduce --dt or select stick for persistent contact")
+
+
 def write_flow_report(args, start, release_times, crossings):
     width = args.flow_interval or args.dt
     edges = start + width * np.arange(math.ceil((args.end - start) / width))
@@ -361,11 +430,13 @@ def run(a):
         raise ValueError("Transient tracking must stay within the saved time range")
     patches = flow.boundary_surfaces()
     outlets, walls = set(a.outlet), set(a.wall)
-    requested = walls | outlets | ({a.patch} if a.patch else set())
+    requested = walls | outlets | set(a.rebounds) | ({a.patch} if a.patch else set())
     if requested - patches.keys():
         raise ValueError(f"Unknown patches: {requested - patches.keys()}. Available: {list(patches)}")
     if walls & outlets:
         raise ValueError("A patch cannot be both --wall and --outlet")
+    if set(a.rebounds) & (walls | outlets):
+        raise ValueError("A rebound patch cannot also be an explicit sticking wall or outlet")
     boundaries = Boundaries(patches, walls | wall_names(a.case), outlets)
     if a.patch:
         xyz = sample_surface(patches[a.patch], a.count, np.random.default_rng(a.seed))
@@ -394,6 +465,8 @@ def run(a):
     if droplet:
         gravity = gravity * (1 - a.gas_density / a.liquid_density)
     finalized = dict.fromkeys(("deposited", "escaped", "boundary", "outside"), 0)
+    if a.rebounds:
+        finalized["rebounded"] = 0
     crossings = {name: [] for name in sorted(outlets)}
     with trajectory_output(a.output, boundaries.names) as emit:
         step = 0
@@ -402,7 +475,6 @@ def run(a):
             end = min(a.end, t+a.dt)
             if end <= t:
                 raise ValueError("dt is below time precision")
-            h = end-t
             stop = np.searchsorted(release_times, end, side="left") if pending < len(seeds) else pending
             step_start = None
             if stop > pending:
@@ -416,7 +488,6 @@ def run(a):
                     emit(birth, positions, born, "active")
                 if birth[-1] > t:
                     step_start = np.concatenate((np.full(len(ids), t), birth))
-                    h = (end-step_start)[:, None]
                 xyz = np.concatenate((xyz, positions)) if len(ids) else positions
                 vel = np.concatenate((vel, initial)) if len(ids) else initial
                 if inertial:
@@ -428,29 +499,9 @@ def run(a):
                 t = end
                 step += 1
                 continue
-            if inertial:
-                tau = (droplet_relaxation(vel - speed, a.diameter, a.liquid_density,
-                                          a.gas_density, a.gas_viscosity)
-                       if droplet else np.asarray([[a.tau]]))
-                trial, speed = relaxation_step(xyz, speed, vel, tau, gravity, h)
-            else:
-                trial = xyz + h*vel
-            patch, fraction = boundaries.hits(xyz, trial)
-            for index in np.unique(patch[patch >= 0]):
-                hit = patch == index
-                u = fraction[hit]
-                finalized[boundaries.status[index]] += len(u)
-                hit_times = (t + h*u if step_start is None else
-                             step_start[hit] + h[hit, 0]*u)
-                if emit:
-                    pos = xyz[hit] + u[:, None]*(trial[hit]-xyz[hit])
-                    emit(hit_times, pos, ids[hit], boundaries.status[index], index)
-                if a.flow_csv and boundaries.status[index] == "escaped":
-                    crossings[boundaries.names[index]].append(hit_times)
-            remaining = patch < 0
-            trial, ids = trial[remaining], ids[remaining]
-            if inertial:
-                speed = speed[remaining]
+            starts = np.full(len(ids), t) if step_start is None else step_start
+            trial, ids, speed = advance_particles(a, flow, boundaries, ids, xyz, vel, speed,
+                                                  starts, end, gravity, emit, finalized, crossings)
             sampled, ok = flow.sample(end, trial) if len(ids) else (trial, np.empty(0, dtype=bool))
             finalized["outside"] += len(ok) - np.count_nonzero(ok)
             if emit:
@@ -470,7 +521,7 @@ def run(a):
             t = end
     if a.flow_csv:
         write_flow_report(a, start, release_times, crossings)
-    if duration:
+    if duration or a.rebounds:
         print(f"injected={pending} active={len(ids)}", *(f"{k}={v}" for k, v in finalized.items()))
 
 
@@ -490,7 +541,7 @@ def config_arguments(path):
         "time": {"start", "end", "dt"},
         "injection": {"patch", "count", "seed", "injection_duration", "initial_velocity"},
         "particle": {"diameter", "tau", "gravity", "liquid_density", "gas_density", "gas_viscosity"},
-        "boundary": {"outlet", "wall"},
+        "boundary": {"outlet", "wall", "rebound"},
         "report": {"track_interval", "flow_interval", "flow_only"},
     }
     positional = {}
@@ -512,6 +563,16 @@ def config_arguments(path):
                     positional[key] = value
                 else:
                     options.append(f"{option}={value}")
+            elif key == "rebound":
+                if not isinstance(value, dict):
+                    raise ValueError(f"{field} requires a table of patch names and coefficients")
+                for name, coeffs in value.items():
+                    if not isinstance(coeffs, dict) or coeffs.keys() - {"e", "mu"}:
+                        raise ValueError(f"{field}.{name} accepts coefficients e and mu")
+                    pair = (coeffs.get("e", 1), coeffs.get("mu", 0))
+                    if not all(type(v) in (float, int) and 0 <= v <= 1 for v in pair):
+                        raise ValueError(f"{field}.{name} requires coefficients between zero and one")
+                    options.extend([option, name, *map(str, pair)])
             elif key in ("outlet", "wall"):
                 if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
                     raise ValueError(f"{field} requires an array of patch names")
@@ -564,6 +625,8 @@ if __name__ == "__main__":
                         help="classify hits on this patch as escaped (repeatable)")
     parser.add_argument("--wall", action="append", default=[], metavar="NAME",
                         help="additional sticking wall (type wall is detected automatically, repeatable)")
+    parser.add_argument("--rebound", nargs=3, metavar=("PATCH", "E", "MU"), action="append", default=[],
+                        help="static rebound patch, normal restitution and tangential damping (repeatable)")
     parser.add_argument("--track-interval", type=float, help="trajectory sampling interval in seconds")
     parser.add_argument("--flow-only", action="store_true", help="use the positional output for the flow CSV only")
     parser.add_argument("--flow-csv", type=Path, help="new CSV for injected and outlet particle rates")
@@ -581,6 +644,17 @@ if __name__ == "__main__":
         except (OSError, ValueError) as exc:
             parser.error(f"{config_option.config}: {exc}")
     args = parser.parse_args(argv)
+    args.rebounds = {}
+    for name, e, mu in args.rebound:
+        try:
+            pair = float(e), float(mu)
+        except ValueError:
+            parser.error("--rebound requires numeric e and mu")
+        if name in args.rebounds or not all(0 <= v <= 1 for v in pair):
+            parser.error("--rebound requires a unique patch and coefficients between zero and one")
+        args.rebounds[name] = pair
+    if args.rebounds and args.diameter is None and args.tau <= 0:
+        parser.error("--rebound requires --diameter or a positive --tau")
     if args.flow_only:
         if args.flow_csv or args.track_interval is not None:
             parser.error("--flow-only uses the positional output and excludes --flow-csv and --track-interval")
