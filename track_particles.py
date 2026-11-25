@@ -31,6 +31,8 @@ class Flow:
             raise ValueError("No saved times in case")
         self.times = vtk_to_numpy(values).copy()
         self.cache = {}
+        self.interval_index = None
+        self.interval_grid = None
 
     def boundary_surfaces(self):
         self.reader.EnableAllPatchArrays()
@@ -64,26 +66,48 @@ class Flow:
             self.cache[index] = copy
         return self.cache[index]
 
-    def sample(self, t, xyz):
+    def interval(self, right):
+        """Expose both nodal velocity fields on one static mesh for a single probe."""
+        if self.interval_index != right:
+            left_grid = self.field(right-1)
+            right_grid = self.field(right)
+            grid = vtk.vtkUnstructuredGrid()
+            grid.CopyStructure(left_grid)
+            grid.GetPointData().AddArray(left_grid.GetPointData().GetArray("U"))
+            velocity = right_grid.GetPointData().GetArray("U")
+            neighbour = velocity.NewInstance()
+            neighbour.ShallowCopy(velocity)
+            neighbour.SetName("U_next")
+            grid.GetPointData().AddArray(neighbour)
+            self.interval_grid = grid
+            self.interval_index = right
+        return self.interval_grid
+
+    @staticmethod
+    def probe(grid, xyz):
         points = vtk.vtkPoints()
-        points.SetData(numpy_to_vtk(np.ascontiguousarray(xyz), deep=True))
+        points.SetData(numpy_to_vtk(np.ascontiguousarray(xyz)))
         cloud = vtk.vtkPolyData()
         cloud.SetPoints(points)
-        j = int(np.clip(np.searchsorted(self.times, t), 0, len(self.times)-1))
-        def probe(i):
-            filt = vtk.vtkProbeFilter()
-            filt.SetSourceData(self.field(i))
-            filt.SetInputData(cloud)
-            filt.Update()
-            data = filt.GetOutput().GetPointData()
-            return vtk_to_numpy(data.GetArray("U")).copy(), vtk_to_numpy(data.GetArray("vtkValidPointMask")).astype(bool)
-        if not j or t == self.times[j]:
-            return probe(j)
-        left, valid = probe(j-1)
-        right, other = probe(j)
-        weight = (t-self.times[j-1]) / (self.times[j]-self.times[j-1])
-        return left + weight*(right-left), valid & other
+        probe = vtk.vtkProbeFilter()
+        probe.SetSourceData(grid)
+        probe.SetInputData(cloud)
+        probe.Update()
+        return probe.GetOutput().GetPointData()
 
+    def interpolate(self, right, t, xyz):
+        data = self.probe(self.interval(right), xyz)
+        left = vtk_to_numpy(data.GetArray("U"))
+        upper = vtk_to_numpy(data.GetArray("U_next"))
+        weight = (t-self.times[right-1]) / (self.times[right]-self.times[right-1])
+        return left + weight*(upper-left), vtk_to_numpy(data.GetArray("vtkValidPointMask")).astype(bool)
+
+    def sample(self, t, xyz):
+        j = int(np.clip(np.searchsorted(self.times, t), 0, len(self.times)-1))
+        if j and t != self.times[j]:
+            return self.interpolate(j, t, xyz)
+        data = self.probe(self.field(j), xyz)
+        return vtk_to_numpy(data.GetArray("U")), vtk_to_numpy(data.GetArray("vtkValidPointMask")).astype(bool)
 
     def sample_release(self, times, xyz):
         """Sample a batch at individual release times using the bracketing fields."""
@@ -94,11 +118,7 @@ class Flow:
         valid = np.empty(len(times), dtype=bool)
         for j in np.unique(right):
             selected = right == j
-            left, left_ok = self.sample(self.times[j-1], xyz[selected])
-            upper, upper_ok = self.sample(self.times[j], xyz[selected])
-            weight = (times[selected] - self.times[j-1]) / (self.times[j] - self.times[j-1])
-            velocity[selected] = left + weight[:, None]*(upper-left)
-            valid[selected] = left_ok & upper_ok
+            velocity[selected], valid[selected] = self.interpolate(j, times[selected, None], xyz[selected])
         return velocity, valid
 
 
@@ -288,6 +308,7 @@ def trajectory_output(path, names):
         writer.SetFileTypeToBinary()
     else:
         writer = vtk.vtkXMLPolyDataWriter()
+        writer.SetCompressorTypeToLZ4()
     writer.SetInputData(tracks)
     with TemporaryDirectory(dir=path.parent) as directory:
         temporary = Path(directory) / path.name
@@ -331,21 +352,26 @@ def advance_particles(a, flow, boundaries, ids, xyz, vel, speed, starts, end,
     """Finish one global step, batching only rebounding particles on later passes."""
     inertial = a.diameter is not None or a.tau > 0
     live = np.ones(len(ids), dtype=bool)
-    positions = np.empty_like(xyz)
-    velocities = np.empty_like(xyz) if inertial else speed
+    velocities = speed
     batch = np.arange(len(ids))
     # Guard against unresolved persistent contact and pathological substep counts.
-    for _ in range(128):
+    for attempt in range(128):
         h = (end-starts)[:, None]
         if inertial:
             tau = (droplet_relaxation(vel-speed, a.diameter, a.liquid_density,
                                       a.gas_density, a.gas_viscosity)
                    if a.diameter is not None else np.full((len(batch), 1), a.tau))
             trial, next_speed = relaxation_step(xyz, speed, vel, tau, gravity, h)
-            velocities[batch] = next_speed
+            if attempt == 0:
+                velocities = next_speed
+            else:
+                velocities[batch] = next_speed
         else:
             trial = xyz + h*vel
-        positions[batch] = trial
+        if attempt == 0:
+            positions = trial
+        else:
+            positions[batch] = trial
         faces, fractions = boundaries.hits(xyz, trial)
         collided = np.flatnonzero(faces >= 0)
         patch_ids = boundaries.patch_ids[faces[collided]]
@@ -379,6 +405,8 @@ def advance_particles(a, flow, boundaries, ids, xyz, vel, speed, starts, end,
             if a.flow_csv and status == "escaped":
                 crossings[name].append(times)
         if not continuing or not any(len(group) for group in continuing):
+            if live.all():
+                return positions, ids, velocities
             return positions[live], ids[live], velocities[live] if inertial else speed
         batch = np.concatenate(continuing)
         starts = np.concatenate(impact_times)

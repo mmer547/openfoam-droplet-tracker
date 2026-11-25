@@ -77,7 +77,7 @@ $$
 
 | 順序 | 関数・クラス | 処理 |
 |---|---|---|
-| 1 | `Flow.field`、`Flow.sample` | VTK でセルの `U` から節点値を作り、粒子位置で補間。保存時刻が複数なら前後の場を時間方向にも線形補間し、最大 2 時刻分をキャッシュ |
+| 1 | `Flow.field`、`Flow.sample` | VTK でセルの `U` から節点値を作り、粒子位置で補間。前後 2 時刻の節点速度を静止メッシュ上でまとめて空間補間し、粒子時刻に線形補間 |
 | 2 | `Flow.boundary_surfaces`、`sample_surface` | パッチを三角形に分割。面積比例で三角形を選び、その内部に一様乱数で初期位置を生成 |
 | 3 | `run`、`droplet_relaxation`、`relaxation_step` | 追跡中の粒子をまとめて計算。各粒子のステップ開始時の **U** と τ から、次の速度と仮の終点を計算 |
 | 4 | `Boundaries.hits` | 静止メッシュの境界三角形を覆う格子を事前計算し、両端が同じ空き格子にある線分を除外。残りの線分と境界三角形の交差を探索。外向きに横切る最初の面で、パッチに応じて反発・付着・流出を処理。投入面から内向きに出発できる |
@@ -155,6 +155,8 @@ python /workspace/track_particles.py case.foam flow.csv --flow-only \
   --patch inlet --count 10000 --seed 42 --outlet outlet \
   --diameter 1e-4 --dt 0.001 --end 1 --flow-interval 0.1
 ```
+
+VTP ファイルの書き出しには LZ4 圧縮を使います。保存する軌跡点の数は計算刻みと保存間隔で決まります。
 
 どちらのモードも液滴の積分、境界判定、出口通過時刻の計算は毎ステップ行います。`--flow-interval` は流量 CSV の集計幅です。
 
