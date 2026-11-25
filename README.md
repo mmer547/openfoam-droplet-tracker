@@ -23,6 +23,8 @@ python /workspace/track_particles.py case.foam seeds.csv tracks.csv \
 
 ## OpenFOAM v2606 と同じ抗力で検証する
 
+**v2606 の粒子追跡まで再現する場合は `--parcel-tracking` を指定します。** WSL の `exportCellPoint` で固定気流場の速度・四面体・セル体積を出力してから実行します。定常 cyclone の2粒径・4時間刻みで全ステップの粒子収支が一致し、20 µm・最小刻みで投入停止後に流出した128個は粒子IDもすべて一致しました。[実行例と検証レポート](docs/cyclone-parcel-tracking.md)
+
 通常の液滴追跡では、`--diameter` を指定すると Schiller–Naumann 抗力を使います。`icoUncoupledKinematicParcelFoam` との比較検証には、OpenFOAM 側の `kinematicCloudProperties` で `particleForces { sphereDrag; gravity; }` を選び、本コードには `--drag-model sphereDrag` を追加します。`--drag-model` は `--diameter` と組み合わせて使う液滴用のオプションです。
 
 次の例は、静止空気中の 100 µm 水滴を高さ 103 mm から落とす検証です。両者で同じメッシュ・速度場・物性と投入座標 (0.043, 0.047, 0.103) m を使い、初速をゼロ、床を完全付着に設定します。`seed.csv` には、この投入座標を `x,y,z` のヘッダーに続けて1行記載します。
@@ -34,6 +36,10 @@ python /workspace/track_particles.py settling.foam seed.csv sphere-half.csv \
 ```
 
 この条件で投入後 0.35 s の沈降速度は、両者とも **0.244026 m/s** でした。軌跡の一致度を調べるため、同時刻の高さと床への到達時刻も比較しています。[ケース設定・時間刻み別の結果](docs/openfoam-v2606-comparison.md#同じ抗力式での検証)
+
+定常化した cyclone では、4秒間投入した後の浮遊数・壁付着数・出口通過数を同じ `sphereDrag` で比較しました。セル探索の修正前後と OpenFOAM v2606 の結果を粒径別に掲載しています。[cyclone の比較結果と回帰試験](docs/cyclone-cell-sampling.md)
+
+流速補間も v2606 にそろえる場合は、WSL で `exportCellPoint` を使ってケースの節点・セル中心の速度と四面体を書き出し、追跡に `--cell-point` を追加します。共通9,390点で直接評価との最大速度差は 6.06 × 10⁻¹⁵ m/s でした。既定では VTK の節点速度を使います。[ビルド・実行手順と粒子収支](docs/cyclone-cell-point.md)
 
 ## 液滴に働く力
 
@@ -72,7 +78,7 @@ $$
 
 | 順序 | 関数・クラス | 処理 |
 |---|---|---|
-| 1 | `Flow.field`、`Flow.sample` | VTK でセルの `U` から節点値を作り、粒子位置で補間。保存時刻が複数なら前後の場を時間方向にも線形補間し、最大 2 時刻分をキャッシュ |
+| 1 | `CellSampler`、`Flow.sample` | 静止メッシュの各粒子について候補セルの三角形表面で内外を判定し、VTK の節点 `U` を所属セルの形状関数で補間。非定常場では前後2時刻に同じ空間重みを使い、時間方向に線形補間 |
 | 2 | `Flow.boundary_surfaces`、`sample_surface` | パッチを三角形に分割。面積比例で三角形を選び、その内部に一様乱数で初期位置を生成 |
 | 3 | `run`、`droplet_relaxation`、`relaxation_step` | 追跡中の粒子をまとめて計算。各粒子のステップ開始時の **U** と τ から、次の速度と仮の終点を計算 |
 | 4 | `Boundaries.hits` | 静止メッシュの境界三角形を覆う格子を事前計算し、両端が同じ空き格子にある線分を除外。残りの線分と境界三角形の交差を探索。外向きに横切る最初の面で追跡を終了。投入面から内向きに出発できる |
@@ -100,6 +106,8 @@ ParaView で `.vtp` または `.vtk` を開くと粒子ごとに 1 本の軌跡�
 | `escaped` | 2 | 指定した出口と交差し、流出として終了 |
 | `boundary` | 3 | その他の境界と交差して終了。周期境界や対称境界も自動通過・反射しない |
 | `outside` | 4 | 境界との交点を得ず、仮の終点で流速を取得できずに終了 |
+
+`outside` が生じた場合、終了点のうち境界パッチ全体の閉曲面の内側にある個数を `outside_inside_mesh` に表示します。境界が閉じていない場合は `unknown` を表示します。
 
 `type wall` の壁は自動検出します。壁を追加する場合は `--wall 名前`、出口は `--outlet 名前` で指定します。どちらも複数回指定できます。境界到達時刻は、移動線分上の交点までの距離割合を使ってステップ内で線形補間します。CSV の `patch` に到達パッチ名、VTK の `patch_id` にその番号が入ります。番号と名前の対応はフィールドデータ `patch_names` にあります。パッチ未到達の点では CSV は空欄、VTK は −1 です。
 

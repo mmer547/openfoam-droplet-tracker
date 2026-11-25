@@ -6,12 +6,103 @@ import math
 import re
 import os
 from contextlib import contextmanager
+from functools import lru_cache
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
 import numpy as np
 import vtk
 from vtk.util.numpy_support import numpy_to_vtk, vtk_to_numpy
+
+
+class CellSampler:
+    """Locate each point independently on the closed faces of a static mesh."""
+
+    def __init__(self, grid):
+        self.grid = vtk.vtkUnstructuredGrid()
+        self.grid.CopyStructure(grid)
+        self.locator = vtk.vtkStaticCellLocator()
+        self.locator.SetDataSet(self.grid)
+        self.locator.BuildLocator()
+        self.tol = 64 * np.finfo(float).eps * max(grid.GetLength(), max(map(abs, grid.GetBounds())))
+        self.candidates = vtk.vtkIdList()
+        # Keep local geometry for active cells without retaining a locator per mesh cell.
+        self.cell = lru_cache(maxsize=1024)(self._build_cell)
+
+    def _build_cell(self, cid):
+        source = self.grid.GetCell(cid)
+        cell = source.NewInstance()
+        cell.DeepCopy(source)
+        ids = np.array([cell.GetPointId(j) for j in range(cell.GetNumberOfPoints())])
+        local = {pid: j for j, pid in enumerate(ids)}
+        faces = vtk.vtkCellArray()
+        reversed_faces = vtk.vtkUnsignedCharArray()
+        reversed_faces.SetName("reversed")
+        for j in range(cell.GetNumberOfFaces()):
+            face = cell.GetFace(j)
+            ring = [face.GetPointId(k) for k in range(face.GetNumberOfPoints())]
+            if face.GetCellType() == vtk.VTK_PIXEL:
+                ring[2], ring[3] = ring[3], ring[2]
+            start = ring.index(min(ring))
+            ring = ring[start:] + ring[:start]
+            # Both neighbours triangulate a shared polygon in the same order.
+            reverse = ring[-1] < ring[1]
+            reversed_faces.InsertNextValue(int(reverse))
+            if reverse:
+                ring = ring[:1] + ring[:0:-1]
+            faces.InsertNextCell(len(ring), [local[pid] for pid in ring])
+        surface = vtk.vtkPolyData()
+        surface.SetPoints(cell.GetPoints())
+        surface.SetPolys(faces)
+        surface.GetCellData().AddArray(reversed_faces)
+        shell = triangles(surface)
+        for i in np.flatnonzero(vtk_to_numpy(shell.GetCellData().GetArray("reversed"))):
+            shell.GetPolys().ReverseCellAtId(i)
+        connectivity = vtk_to_numpy(shell.GetPolys().GetConnectivityArray()).reshape(-1, 3)
+        points = vtk_to_numpy(cell.GetPoints().GetData()).astype(float)
+        a, b, c = (points - points[0])[connectivity].transpose(1, 0, 2)
+        # A negative signed volume means this cell's faces wind inward.
+        if np.einsum("ij,ij->", a, np.cross(b, c)) < 0:
+            for i in range(len(connectivity)):
+                shell.GetPolys().ReverseCellAtId(i)
+        distance = vtk.vtkImplicitPolyDataDistance()
+        distance.SetInput(shell)
+        return cell, ids, distance
+
+    def locate(self, point):
+        cid = self.locator.FindCell(point)
+        if (cid >= 0 and self.locator.InsideCellBounds(point, cid)
+                and self.cell(cid)[2].EvaluateFunction(point) < -self.tol):
+            return cid
+        # A warped cell can fail VTK's parametric test. Check all nearby shells.
+        # Sorting also gives points on shared faces and edges a stable owner.
+        box = [v for x in point for v in (x - self.tol, x + self.tol)]
+        self.locator.FindCellsWithinBounds(box, self.candidates)
+        for cid in sorted(self.candidates.GetId(i) for i in range(self.candidates.GetNumberOfIds())):
+            if (self.locator.InsideCellBounds(point, cid, self.tol)
+                    and self.cell(cid)[2].EvaluateFunction(point) <= self.tol):
+                return cid
+        return -1
+
+    def stencil(self, xyz):
+        rows, nodes, coeffs = [], [], []
+        valid = np.zeros(len(xyz), dtype=bool)
+        for i, point in enumerate(xyz):
+            cid = self.locate(point)
+            if cid < 0:
+                continue
+            cell, ids, _ = self.cell(cid)
+            weights = [0.] * len(ids)
+            result = cell.EvaluatePosition(point, [0.]*3, vtk.reference(0), [0.]*3,
+                                           vtk.reference(0.), weights)
+            # A warped cell can supply valid shape weights with parametric status 0.
+            if result < 0:
+                continue
+            valid[i] = True
+            rows.extend([i] * len(ids))
+            nodes.extend(ids)
+            coeffs.extend(weights)
+        return valid, np.asarray(rows, dtype=int), np.asarray(nodes, dtype=int), np.asarray(coeffs)
 
 
 class Flow:
@@ -30,6 +121,7 @@ class Flow:
             raise ValueError("No saved times in case")
         self.times = vtk_to_numpy(values).copy()
         self.cache = {}
+        self.sampler = None
 
     def boundary_surfaces(self):
         self.reader.EnableAllPatchArrays()
@@ -63,26 +155,31 @@ class Flow:
             self.cache[index] = copy
         return self.cache[index]
 
-    def sample(self, t, xyz):
-        points = vtk.vtkPoints()
-        points.SetData(numpy_to_vtk(np.ascontiguousarray(xyz), deep=True))
-        cloud = vtk.vtkPolyData()
-        cloud.SetPoints(points)
-        j = int(np.clip(np.searchsorted(self.times, t), 0, len(self.times)-1))
-        def probe(i):
-            filt = vtk.vtkProbeFilter()
-            filt.SetSourceData(self.field(i))
-            filt.SetInputData(cloud)
-            filt.Update()
-            data = filt.GetOutput().GetPointData()
-            return vtk_to_numpy(data.GetArray("U")).copy(), vtk_to_numpy(data.GetArray("vtkValidPointMask")).astype(bool)
-        if not j or t == self.times[j]:
-            return probe(j)
-        left, valid = probe(j-1)
-        right, other = probe(j)
-        weight = (t-self.times[j-1]) / (self.times[j]-self.times[j-1])
-        return left + weight*(right-left), valid & other
+    def values(self, index):
+        return vtk_to_numpy(self.field(index).GetPointData().GetArray("U"))
 
+    def _sample_between(self, lower, upper, weight, xyz):
+        if self.sampler is None:
+            self.sampler = CellSampler(self.field(lower))
+        valid, rows, nodes, coeffs = self.sampler.stencil(xyz)
+
+        def probe(i):
+            values = self.values(i)
+            velocity = np.zeros((len(xyz), 3))
+            np.add.at(velocity, rows, coeffs[:, None] * values[nodes])
+            # Match the field precision produced by VTK's point-data interpolation.
+            return velocity.astype(values.dtype, copy=False)
+        left = probe(lower)
+        if lower == upper:
+            return left, valid
+        return left + weight*(probe(upper)-left), valid
+
+    def sample(self, t, xyz):
+        j = int(np.clip(np.searchsorted(self.times, t), 0, len(self.times)-1))
+        if not j or t == self.times[j]:
+            return self._sample_between(j, j, 0., xyz)
+        weight = (t-self.times[j-1]) / (self.times[j]-self.times[j-1])
+        return self._sample_between(j-1, j, weight, xyz)
 
     def sample_release(self, times, xyz):
         """Sample a batch at individual release times using the bracketing fields."""
@@ -93,12 +190,22 @@ class Flow:
         valid = np.empty(len(times), dtype=bool)
         for j in np.unique(right):
             selected = right == j
-            left, left_ok = self.sample(self.times[j-1], xyz[selected])
-            upper, upper_ok = self.sample(self.times[j], xyz[selected])
             weight = (times[selected] - self.times[j-1]) / (self.times[j] - self.times[j-1])
-            velocity[selected] = left + weight[:, None]*(upper-left)
-            valid[selected] = left_ok & upper_ok
+            velocity[selected], valid[selected] = self._sample_between(j-1, j, weight[:, None], xyz[selected])
         return velocity, valid
+
+
+class CellPointFlow(Flow):
+    def __init__(self, marker):
+        super().__init__(marker)
+        from cell_point import CellPointData
+        self.sampler = CellPointData(Path(marker).parent / "postProcessing/trackerCellPoint", self.times)
+
+    def values(self, index):
+        return self.sampler.values(index)
+
+    def boundary_surfaces(self):
+        return {name: self.sampler.patch_surface(name) for name in super().boundary_surfaces()}
 
 
 def triangles(surface):
@@ -229,6 +336,19 @@ class Boundaries:
                     patch[i] = self.patch_ids[face]
         return patch, fraction
 
+    def count_enclosed(self, xyz):
+        """Independently classify failed samples against the complete boundary."""
+        clean = vtk.vtkCleanPolyData()
+        clean.SetInputData(self.locator.GetDataSet())
+        clean.Update()
+        surface = clean.GetOutput()
+        if not vtk.vtkSelectEnclosedPoints.IsSurfaceClosed(surface):
+            return None
+        enclosed = vtk.vtkSelectEnclosedPoints()
+        enclosed.SetTolerance(1e-8)
+        enclosed.Initialize(surface)
+        return sum(enclosed.IsInsideSurface(point) for point in xyz)
+
 
 @contextmanager
 def trajectory_output(path, names):
@@ -358,8 +478,68 @@ def write_flow_report(args, start, release_times, crossings):
                                  volume_rate, mass_rate])
 
 
+def run_parcels(a, flow, boundaries, seeds, releases, start):
+    from parcel_tracking import ParcelTracker
+    tracker = ParcelTracker(flow.sampler, boundaries.names, len(seeds), a.diameter,
+                            a.liquid_density, a.gas_density, a.gas_viscosity, a.gravity, 1.)
+    counts = dict.fromkeys(("deposited", "escaped", "boundary", "outside"), 0)
+    crossings = {name: [] for name in sorted(a.outlet)}
+    injected_at = np.empty_like(releases)
+    live = np.empty(0, dtype=int)
+    pending = step = last_bin = 0
+    t = start
+    with trajectory_output(a.output, boundaries.names) as emit:
+        def move(ids, interval, fraction, step_end):
+            patch, at = tracker.advance(ids, interval, fraction)
+            for index in np.unique(patch[patch >= 0]):
+                hit = patch == index
+                times = step_end - (1-at[hit])*np.broadcast_to(interval, at.shape)[hit]
+                # During the second pass a newborn parcel can hit before its
+                # pseudo-injection time on the carrier clock. Keep CSV events ordered.
+                times = np.maximum(times, injected_at[ids[hit]])
+                status = boundaries.status[index]
+                counts[status] += int(hit.sum())
+                if emit:
+                    emit(times, tracker.position(ids[hit]), ids[hit], status, index)
+                if a.flow_csv and status == "escaped":
+                    crossings[boundaries.names[index]].append(times)
+            return ids[patch < 0]
+
+        while t < a.end and (len(live) or pending < len(seeds)):
+            end = min(t+a.dt, a.end)
+            dt = end-t
+            if dt <= 0:
+                raise ValueError("dt is below time precision")
+            stop = np.searchsorted(releases, end, side="left")
+            if stop > pending:
+                born = np.arange(pending, stop)
+                tracker.release(born, seeds[born], flow.sampler, a.initial_velocity)
+                width = min(dt, max(0., releases[-1]-t))
+                injection = t + width*np.arange(len(born))/len(born)
+                injected_at[born] = injection
+                if emit:
+                    emit(injection, seeds[born], born, "active")
+                # v2606 InjectionModel::inject moves a new parcel first.
+                # Cloud::move then resets stepFraction on the entire cloud.
+                interval = end-injection
+                born = move(born, interval, (dt-interval)/dt, end)
+                live = np.concatenate((live, born))
+                pending = stop
+            live = move(live, dt, 0., end)
+            step += 1
+            save_bin = (math.floor(math.nextafter(step*a.dt/a.track_interval, math.inf))
+                        if a.track_interval and a.track_interval > a.dt else step)
+            if emit and len(live) and (save_bin > last_bin or end == a.end):
+                emit(end, tracker.position(live), live, "active")
+            last_bin, t = save_bin, end
+    if a.flow_csv:
+        write_flow_report(a, start, injected_at[:pending], crossings)
+    if a.injection_duration:
+        print(f"injected={pending} active={len(live)}", *(f"{k}={v}" for k, v in counts.items()))
+
+
 def run(a):
-    flow = Flow(a.case)
+    flow = CellPointFlow(a.case) if getattr(a, "cell_point", False) else Flow(a.case)
     t = float(flow.times[0]) if a.start is None else a.start
     if not all(map(math.isfinite, [a.dt, t, a.end, a.tau, *a.gravity])) or a.dt <= 0 or a.tau < 0 or a.end <= t:
         raise ValueError("Require finite parameters, dt > 0, tau >= 0 and start < end")
@@ -390,6 +570,10 @@ def run(a):
     release_times = start + duration * (np.arange(len(seeds)) / len(seeds))
     if release_times[-1] >= a.end:
         raise ValueError("Release schedule exceeds available time precision")
+    if getattr(a, "parcel_tracking", False):
+        if len(flow.times) != 1:
+            raise ValueError("The v2606 parcel comparison requires one frozen velocity field")
+        return run_parcels(a, flow, boundaries, seeds, release_times, start)
     pending = 0
     ids = np.empty(0, dtype=np.intp)
     xyz = seeds[:0]
@@ -401,6 +585,7 @@ def run(a):
     if droplet:
         gravity = gravity * (1 - a.gas_density / a.liquid_density)
     finalized = dict.fromkeys(("deposited", "escaped", "boundary", "outside"), 0)
+    missed = []
     crossings = {name: [] for name in sorted(outlets)}
     with trajectory_output(a.output, boundaries.names) as emit:
         step = 0
@@ -460,6 +645,8 @@ def run(a):
                 speed = speed[remaining]
             sampled, ok = flow.sample(end, trial) if len(ids) else (trial, np.empty(0, dtype=bool))
             finalized["outside"] += len(ok) - np.count_nonzero(ok)
+            if not ok.all():
+                missed.append(trial[~ok])
             if emit:
                 emit(end, trial[~ok], ids[~ok], "outside")
             xyz, vel, ids = trial[ok], sampled[ok], ids[ok]
@@ -479,6 +666,9 @@ def run(a):
         write_flow_report(a, start, release_times, crossings)
     if duration:
         print(f"injected={pending} active={len(ids)}", *(f"{k}={v}" for k, v in finalized.items()))
+    if missed:
+        count = boundaries.count_enclosed(np.concatenate(missed))
+        print("outside_inside_mesh=" + ("unknown" if count is None else str(count)))
 
 
 if __name__ == "__main__":
@@ -487,6 +677,10 @@ if __name__ == "__main__":
     parser.add_argument("seeds", nargs="?", type=Path, help="CSV with x,y,z columns")
     parser.add_argument("output", type=Path, help="trajectory file (.csv, .vtk or .vtp), or flow CSV with --flow-only")
     parser.add_argument("--start", type=float)
+    parser.add_argument("--cell-point", action="store_true",
+                        help="use the v2606 exportCellPoint data in the case instead of VTK nodal U")
+    parser.add_argument("--parcel-tracking", action="store_true",
+                        help="compare with v2606 face tracking, sphereDrag, analytical U and maxCo=1")
     parser.add_argument("--end", required=True, type=float)
     parser.add_argument("--dt", required=True, type=float)
     model = parser.add_mutually_exclusive_group()
@@ -514,6 +708,10 @@ if __name__ == "__main__":
     parser.add_argument("--flow-csv", type=Path, help="new CSV for injected and outlet particle rates")
     parser.add_argument("--flow-interval", type=float, help="flow averaging interval in seconds (default: dt)")
     args = parser.parse_args()
+    if args.parcel_tracking:
+        if args.diameter is None or getattr(args, "drag_model", "sphereDrag") != "sphereDrag":
+            parser.error("--parcel-tracking requires --diameter and sphereDrag")
+        args.cell_point, args.drag_model = True, "sphereDrag"
     if hasattr(args, "drag_model") and args.diameter is None:
         parser.error("--drag-model requires --diameter")
     if args.flow_only:
