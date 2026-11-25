@@ -21,6 +21,20 @@ python /workspace/track_particles.py case.foam seeds.csv tracks.csv \
   --diameter 1e-4 --outlet outlet --end 1 --dt 0.001
 ```
 
+## OpenFOAM v2606 と同じ抗力で検証する
+
+通常の液滴追跡では、`--diameter` を指定すると Schiller–Naumann 抗力を使います。`icoUncoupledKinematicParcelFoam` との比較検証には、OpenFOAM 側の `kinematicCloudProperties` で `particleForces { sphereDrag; gravity; }` を選び、本コードには `--drag-model sphereDrag` を追加します。`--drag-model` は `--diameter` と組み合わせて使う液滴用のオプションです。
+
+次の例は、静止空気中の 100 µm 水滴を高さ 103 mm から落とす検証です。両者で同じメッシュ・速度場・物性と投入座標 (0.043, 0.047, 0.103) m を使い、初速をゼロ、床を完全付着に設定します。`seed.csv` には、この投入座標を `x,y,z` のヘッダーに続けて1行記載します。
+
+```bash
+python /workspace/track_particles.py settling.foam seed.csv sphere-half.csv \
+  --diameter 1e-4 --drag-model sphereDrag --initial-velocity 0 0 0 \
+  --end 0.48 --dt 0.0005
+```
+
+この条件で投入後 0.35 s の沈降速度は、両者とも **0.244026 m/s** でした。軌跡の一致度を調べるため、同時刻の高さと床への到達時刻も比較しています。[ケース設定・時間刻み別の結果](docs/openfoam-v2606-comparison.md#同じ抗力式での検証)
+
 ## 液滴に働く力
 
 液滴中心の位置を **x**、液滴速度を **v**、その位置での気体速度を **U** とします。相対速度 **w** = **U** − **v** を使うと、抗力は液滴を気体速度に近づける向きに働きます。体積を $V=\pi d^3/6$、投影面積を $A=\pi d^2/4$、質量を $m=\rho_l V$ とすると、運動方程式は次のとおりです。
@@ -44,11 +58,13 @@ $$
 | 重力加速度 **g** | `--gravity` | (0, 0, −9.81) m/s² |
 | 液滴初速 **v** | `--initial-velocity` | 投入位置での **U**。指定時は全液滴に共通の 3 成分（m/s） |
 
-**抗力係数。** 粒子レイノルズ数 $Re_p=\rho_g d |\mathbf{w}|/\mu_g$ から、各液滴の抗力係数を毎ステップ更新します。$0<Re_p<1000$ では Schiller–Naumann 相関 $C_D=(24/Re_p)(1+0.15 Re_p^{0.687})$、$Re_p\ge1000$ では $C_D=0.44$ を使います。
+**抗力係数。** 粒子レイノルズ数 $Re_p=\rho_g d |\mathbf{w}|/\mu_g$ から、各液滴の抗力係数を毎ステップ更新します。既定の Schiller–Naumann 相関では、$0<Re_p<1000$ で $C_D=(24/Re_p)(1+0.15 Re_p^{0.687})$、$Re_p\ge1000$ で $C_D=0.44$ を使います。
+
+比較検証用の `sphereDrag` では $0<Re_p\le1000$ で $C_D=(24/Re_p)(1+Re_p^{2/3}/6)$、$Re_p>1000$ で $C_D=0.424$ を使います。
 
 **コード内の表現。** `droplet_relaxation` は $f=C_D Re_p/24$ とし、有効緩和時間 $\tau=\rho_l d^2/(18\mu_g f)$ を返します。抗力加速度は **w** / τ です。低 $Re_p$ で $f$ は 1 に近づき、ストークス抵抗になります。相対速度ゼロでは $f=1$、抗力ゼロから計算を開始できます。
 
-**計算値の目安。** 表の既定物性で、直径 100 µm の水滴が静止空気中を落下すると、抗力が浮力込みの重力と釣り合う終端速度は約 **0.248 m/s**（下向き）です。このとき $Re_p\approx1.65$ です。これは抗力式から得られる基準値で、実験値との照合は別途必要です。
+**計算値の目安。** 表の既定物性で、直径 100 µm の水滴が静止空気中を落下すると、抗力が浮力込みの重力と釣り合う終端速度は Schiller–Naumann で約 **0.248 m/s**（$Re_p\approx1.65$）、`sphereDrag` で約 **0.244 m/s**（下向き）です。これは抗力式から得られる基準値で、実験値との照合は別途必要です。
 
 液滴は直径・密度が一定の球形点粒子として扱い、気体物性も一定です。蒸発、変形・分裂、液滴同士の衝突、揚力、未解像の乱流によるランダムな分散はモデルの対象外です。壁への到達判定には液滴中心を使います。
 

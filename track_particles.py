@@ -296,12 +296,19 @@ def trajectory_output(path, names):
         os.link(temporary, path)
 
 
-def droplet_relaxation(slip, diameter, liquid_density, gas_density, gas_viscosity):
-    """Effective relaxation time for a sphere under Schiller-Naumann drag."""
+def droplet_relaxation(slip, diameter, liquid_density, gas_density, gas_viscosity,
+                       drag_model="schiller-naumann"):
+    """Effective relaxation time for the selected spherical droplet drag law."""
     reynolds = gas_density * diameter * np.linalg.norm(slip, axis=1) / gas_viscosity
     # Cd*Re/24 has a finite limit at zero slip.
-    correction = np.where(reynolds < 1000, 1 + 0.15 * reynolds**0.687,
-                          (0.44 / 24) * reynolds)
+    if drag_model == "schiller-naumann":
+        correction = np.where(reynolds < 1000, 1 + 0.15 * reynolds**0.687,
+                              (0.44 / 24) * reynolds)
+    elif drag_model == "sphereDrag":
+        correction = np.where(reynolds <= 1000, 1 + reynolds**(2 / 3) / 6,
+                              (0.424 / 24) * reynolds)
+    else:
+        raise ValueError(f"Unknown drag model: {drag_model}")
     return (liquid_density * diameter**2 / (18 * gas_viscosity) / correction)[:, None]
 
 
@@ -388,6 +395,7 @@ def run(a):
     xyz = seeds[:0]
     vel = speed = xyz
     droplet = a.diameter is not None
+    drag_model = getattr(a, "drag_model", "schiller-naumann")
     inertial = droplet or a.tau > 0
     gravity = np.asarray(a.gravity)
     if droplet:
@@ -429,7 +437,7 @@ def run(a):
                 continue
             if inertial:
                 tau = (droplet_relaxation(vel - speed, a.diameter, a.liquid_density,
-                                          a.gas_density, a.gas_viscosity)
+                                          a.gas_density, a.gas_viscosity, drag_model)
                        if droplet else np.asarray([[a.tau]]))
                 trial, speed = relaxation_step(xyz, speed, vel, tau, gravity, h)
             else:
@@ -484,6 +492,9 @@ if __name__ == "__main__":
     model = parser.add_mutually_exclusive_group()
     model.add_argument("--diameter", type=float, help="enable spherical droplet drag, diameter in m")
     model.add_argument("--tau", type=float, default=0, help="Stokes relaxation time in seconds")
+    parser.add_argument("--drag-model", choices=("schiller-naumann", "sphereDrag"),
+                        default=argparse.SUPPRESS,
+                        help="drag law for --diameter (default: schiller-naumann; sphereDrag for OpenFOAM v2606 comparison)")
     parser.add_argument("--gravity", nargs=3, type=float, help="gravity in m/s^2 (droplets default to 0 0 -9.81, --tau to zero)")
     parser.add_argument("--liquid-density", type=float, help="droplet density in kg/m^3 (default 998.2)")
     parser.add_argument("--gas-density", type=float, help="gas density in kg/m^3 (default 1.204)")
@@ -503,6 +514,8 @@ if __name__ == "__main__":
     parser.add_argument("--flow-csv", type=Path, help="new CSV for injected and outlet particle rates")
     parser.add_argument("--flow-interval", type=float, help="flow averaging interval in seconds (default: dt)")
     args = parser.parse_args()
+    if hasattr(args, "drag_model") and args.diameter is None:
+        parser.error("--drag-model requires --diameter")
     if args.flow_only:
         if args.flow_csv or args.track_interval is not None:
             parser.error("--flow-only uses the positional output and excludes --flow-csv and --track-interval")
