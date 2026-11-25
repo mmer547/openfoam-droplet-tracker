@@ -1,4 +1,4 @@
-# OpenFOAM 後処理による液滴追跡
+# OpenFOAM 後処理による液滴追跡 — 技術ドキュメント
 
 [track_particles.py](./track_particles.py) は、OpenFOAM で保存した気体速度場 `U` を読み、個々の液滴の位置と速度を時間積分する Python スクリプトです。同じ流れ場を使って液滴径や投入位置を変え、出口への到達時間や壁への付着率を比較できます。静止した再構築済みメッシュを使い、液滴から気体への運動量のフィードバックを無視できる希薄な条件を想定します。
 
@@ -21,25 +21,30 @@ python /workspace/track_particles.py case.foam seeds.csv tracks.csv \
   --diameter 1e-4 --outlet outlet --end 1 --dt 0.001
 ```
 
-## OpenFOAM v2606 と同じ抗力で検証する
+## 追跡モードの選び方
 
-**v2606 の粒子追跡まで再現する場合は `--parcel-tracking` を指定します。** WSL の `exportCellPoint` で固定気流場の速度・四面体・セル体積を出力してから実行します。定常 cyclone の2粒径・4時間刻みで全ステップの粒子収支が一致し、20 µm・最小刻みで投入停止後に流出した128個は粒子IDもすべて一致しました。[実行例と検証レポート](docs/cyclone-parcel-tracking.md)
+| 目的 | オプション | 気体速度の補間と粒子の移動 |
+|---|---|---|
+| 保存した気流場で液滴を追跡する | `--diameter d` | VTK の節点速度を補間し、ステップ内の気体速度と抗力係数を固定して位置・速度を積分する。既定の抗力は Schiller–Naumann |
+| 抗力相関だけを v2606 に合わせる | `--diameter d --drag-model sphereDrag` | 通常の補間・時間積分で v2606 の球形粒子用抗力を使う |
+| 気体速度の補間を v2606 に合わせる | `--cell-point` | セル中心と面の3頂点の速度を四面体の重心座標で補間する。複数の保存時刻では前後の速度場を時間方向に線形補間する |
+| `icoUncoupledKinematicParcelFoam` v2606 の粒子追跡を再現する | `--parcel-tracking --diameter d` | 1時刻の固定場で `cellPoint`、`sphereDrag`、解析的な速度更新、`maxCo = 1` を使用する。現在の粒子速度でセル面まで移動し、到達点の気体速度で粒子速度を更新する |
 
-通常の液滴追跡では、`--diameter` を指定すると Schiller–Naumann 抗力を使います。`icoUncoupledKinematicParcelFoam` との比較検証には、OpenFOAM 側の `kinematicCloudProperties` で `particleForces { sphereDrag; gravity; }` を選び、本コードには `--drag-model sphereDrag` を追加します。`--drag-model` は `--diameter` と組み合わせて使う液滴用のオプションです。
-
-次の例は、静止空気中の 100 µm 水滴を高さ 103 mm から落とす検証です。両者で同じメッシュ・速度場・物性と投入座標 (0.043, 0.047, 0.103) m を使い、初速をゼロ、床を完全付着に設定します。`seed.csv` には、この投入座標を `x,y,z` のヘッダーに続けて1行記載します。
+`--cell-point` と `--parcel-tracking` には、v2606 のエクスポーターで出力した四面体、境界面、節点・セル中心の速度が必要です。セル面追跡にはセル体積も使います。WSL でリポジトリのルートから次を実行します。`frozen` は再構築済みの固定場ケースです。
 
 ```bash
-python /workspace/track_particles.py settling.foam seed.csv sphere-half.csv \
-  --diameter 1e-4 --drag-model sphereDrag --initial-velocity 0 0 0 \
-  --end 0.48 --dt 0.0005
+source /usr/lib/openfoam/openfoam2606/etc/bashrc
+wmake tools/exportCellPoint
+exportCellPoint -case frozen
 ```
 
-この条件で投入後 0.35 s の沈降速度は、両者とも **0.244026 m/s** でした。軌跡の一致度を調べるため、同時刻の高さと床への到達時刻も比較しています。[ケース設定・時間刻み別の結果](docs/openfoam-v2606-comparison.md#同じ抗力式での検証)
+出力先はケース内の `postProcessing/trackerCellPoint` です。ケース更新後に再生成するときは、既存の出力を先に退避します。補間値を直接照合する場合は、初回のエクスポートに `-samplePoints coordinates.dat` を加えます。このファイルは1行に1点、空白区切りの x y z 座標（m）を記載します。
 
-定常化した cyclone では、4秒間投入した後の浮遊数・壁付着数・出口通過数を同じ `sphereDrag` で比較しました。セル探索の修正前後と OpenFOAM v2606 の結果を粒径別に掲載しています。[cyclone の比較結果と回帰試験](docs/cyclone-cell-sampling.md)
+```bash
+python tools/check_cell_point.py frozen/cyclone.foam coordinates.dat --time 0
+```
 
-流速補間も v2606 にそろえる場合は、WSL で `exportCellPoint` を使ってケースの節点・セル中心の速度と四面体を書き出し、追跡に `--cell-point` を追加します。共通9,390点で直接評価との最大速度差は 6.06 × 10⁻¹⁵ m/s でした。既定では VTK の節点速度を使います。[ビルド・実行手順と粒子収支](docs/cyclone-cell-point.md)
+粒子追跡全体の実行例、投入停止後の残存・流出、適用範囲は[最終検証レポート](docs/cyclone-parcel-tracking.md)にまとめています。
 
 ## 液滴に働く力
 
@@ -66,7 +71,7 @@ $$
 
 **抗力係数。** 粒子レイノルズ数 $Re_p=\rho_g d |\mathbf{w}|/\mu_g$ から、各液滴の抗力係数を毎ステップ更新します。既定の Schiller–Naumann 相関では、$0<Re_p<1000$ で $C_D=(24/Re_p)(1+0.15 Re_p^{0.687})$、$Re_p\ge1000$ で $C_D=0.44$ を使います。
 
-比較検証用の `sphereDrag` では $0<Re_p\le1000$ で $C_D=(24/Re_p)(1+Re_p^{2/3}/6)$、$Re_p>1000$ で $C_D=0.424$ を使います。
+両モデルの違いは、同じ相対速度に対する抗力を決める経験式です。比較検証用の `sphereDrag` では $0<Re_p\le1000$ で $C_D=(24/Re_p)(1+Re_p^{2/3}/6)$、$Re_p>1000$ で $C_D=0.424$ を使います。
 
 **コード内の表現。** `droplet_relaxation` は $f=C_D Re_p/24$ とし、有効緩和時間 $\tau=\rho_l d^2/(18\mu_g f)$ を返します。抗力加速度は **w** / τ です。低 $Re_p$ で $f$ は 1 に近づき、ストークス抵抗になります。相対速度ゼロでは $f=1$、抗力ゼロから計算を開始できます。
 
@@ -74,7 +79,7 @@ $$
 
 液滴は直径・密度が一定の球形点粒子として扱い、気体物性も一定です。蒸発、変形・分裂、液滴同士の衝突、揚力、未解像の乱流によるランダムな分散はモデルの対象外です。壁への到達判定には液滴中心を使います。
 
-## コードを追う順序
+## 通常モードの処理と時間積分
 
 | 順序 | 関数・クラス | 処理 |
 |---|---|---|
@@ -153,6 +158,6 @@ python /workspace/track_particles.py case.foam tracks.vtp \
   --flow-csv flow.csv --flow-interval 0.1
 ```
 
-総数 N、投入時間 T に対し、粒子 ID i の投入時刻は `start + i × T / N`（i = 0 … N−1）です。非定常場では各投入時刻の流速を補間し、途中で投入した粒子はそのステップの残り時間だけ進めます。CSV で位置を指定した場合は行順で投入します。T の既定値は 0（一括投入）です。時間指定は流量のみのモードにも適用できます。
+通常モードでは、総数 N、投入時間 T に対し、粒子 ID i の投入時刻は `start + i × T / N`（i = 0 … N−1）です。非定常場では各投入時刻の流速を補間し、途中で投入した粒子はそのステップの残り時間だけ進めます。CSV で位置を指定した場合は行順で投入します。T の既定値は 0（一括投入）です。時間指定は流量のみのモードにも適用できます。
 
 終了区間の流量 CSV で、対象パッチ（例では `outletA`）の累積通過個数を `injected` の累積個数で割ると、その時刻までにその出口を通過した粒子の割合が得られます。時間指定投入の実行後には、投入総数、領域内に残った粒子数（`active`）、状態別の終了数を表示します。
