@@ -30,6 +30,8 @@ python /workspace/track_particles.py case.foam seeds.csv tracks.csv \
 | 気体速度の補間を v2606 に合わせる | `--cell-point` | セル中心と面の3頂点の速度を四面体の重心座標で補間する。複数の保存時刻では前後の速度場を時間方向に線形補間する |
 | `icoUncoupledKinematicParcelFoam` v2606 の粒子追跡を再現する | `--parcel-tracking --diameter d` | 1時刻の固定場で `cellPoint`、`sphereDrag`、解析的な速度更新、`maxCo = 1` を使用する。現在の粒子速度でセル面まで移動し、到達点の気体速度で粒子速度を更新する |
 
+通常モードでは `--cell-cache-size 2048` のように、形状をメモリに保持するセル数の上限を指定できます。既定は1,024セルです。粒子が同じセルを繰り返し通る計算では、上限を増やすと形状の再構築を減らせます。必要なメモリは保持するセルの数と形状に依存します。この設定は通常モードの VTK 補間に適用されます。
+
 `--cell-point` と `--parcel-tracking` には、v2606 のエクスポーターで出力した四面体、境界面、節点・セル中心の速度が必要です。セル面追跡にはセル体積も使います。WSL でリポジトリのルートから次を実行します。`frozen` は再構築済みの固定場ケースです。
 
 ```bash

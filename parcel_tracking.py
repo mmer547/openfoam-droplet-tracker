@@ -63,7 +63,8 @@ class ParcelTracker:
         self.u[ids] = self.interpolate(ids) if initial is None else initial
 
     def interpolate(self, ids):
-        return (self.values[self.nodes[self.tet[ids]]] * self.y[ids, :, None]).sum(axis=1)
+        weighted = self.values[self.nodes[self.tet[ids]]] * self.y[ids, :, None]
+        return weighted[:, 0] + weighted[:, 1] + weighted[:, 2] + weighted[:, 3]
 
     def position(self, ids):
         return (self.points[self.nodes[self.tet[ids]]] * self.y[ids, :, None]).sum(axis=1)
@@ -106,7 +107,9 @@ class ParcelTracker:
                 t = self.tet[p]
                 y = self.y[p]
                 displacement = (remaining[sub]*f[sub])[:, None]*travel[sub]
-                dx = (self.transform[t]*displacement[:, None, :]).sum(axis=2)
+                # Sum the three Cartesian components in order on this hot path.
+                terms = self.transform[t] * displacement[:, None, :]
+                dx = terms[:, :, 0] + terms[:, :, 1] + terms[:, :, 2]
                 mu = np.full_like(dx, np.inf)
                 np.divide(-y, dx, out=mu, where=dx < -self.det[t, None]*1e-15)
                 side = mu.argmin(axis=1)

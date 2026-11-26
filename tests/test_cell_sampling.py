@@ -6,14 +6,15 @@ import numpy as np
 import vtk
 from vtk.util.numpy_support import numpy_to_vtk, vtk_to_numpy
 
-from track_particles import Boundaries, Flow, triangles
+from track_particles import Boundaries, DEFAULT_CELL_CACHE_SIZE, Flow, triangles
 
 
-def flow_for(*fields):
+def flow_for(*fields, cell_cache_size=DEFAULT_CELL_CACHE_SIZE):
     flow = Flow.__new__(Flow)
     flow.times = np.arange(len(fields), dtype=float)
     flow.field = Mock(side_effect=fields.__getitem__)
     flow.sampler = None
+    flow.cell_cache_size = cell_cache_size
     return flow
 
 
@@ -57,13 +58,14 @@ class SamplingTests(unittest.TestCase):
         np.testing.assert_allclose(flow.sample(0., points[-1:])[0], points[-1:], atol=3e-8)
 
     def test_shared_faces_edges_inward_release_and_exterior(self):
-        flow = flow_for(boxes())
+        flow = flow_for(boxes(), cell_cache_size=1)
         points = np.array([[0, .4, .6], [1e-6, .4, .6], [1, .3, .2],
                            [1, 0, 0], [1.1, .3, .2], [-1e-6, .4, .6]])
         velocity, valid = flow.sample_release(np.zeros(len(points)), points)
         np.testing.assert_array_equal(valid, [True]*5 + [False])
         np.testing.assert_allclose(velocity[valid], points[valid], atol=1e-14)
         self.assertEqual([flow.sampler.locate(p) for p in points], [0, 0, 0, 0, 1, -1])
+        self.assertEqual(flow.sampler.cell.cache_info().currsize, 1)
 
     def test_spatial_and_temporal_interpolation_at_release(self):
         first = boxes()

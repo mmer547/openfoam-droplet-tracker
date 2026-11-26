@@ -15,10 +15,13 @@ import vtk
 from vtk.util.numpy_support import numpy_to_vtk, vtk_to_numpy
 
 
+DEFAULT_CELL_CACHE_SIZE = 1024
+
+
 class CellSampler:
     """Locate each point independently on the closed faces of a static mesh."""
 
-    def __init__(self, grid):
+    def __init__(self, grid, cache_size=DEFAULT_CELL_CACHE_SIZE):
         self.grid = vtk.vtkUnstructuredGrid()
         self.grid.CopyStructure(grid)
         self.locator = vtk.vtkStaticCellLocator()
@@ -27,7 +30,7 @@ class CellSampler:
         self.tol = 64 * np.finfo(float).eps * max(grid.GetLength(), max(map(abs, grid.GetBounds())))
         self.candidates = vtk.vtkIdList()
         # Keep local geometry for active cells without retaining a locator per mesh cell.
-        self.cell = lru_cache(maxsize=1024)(self._build_cell)
+        self.cell = lru_cache(maxsize=cache_size)(self._build_cell)
 
     def _build_cell(self, cid):
         source = self.grid.GetCell(cid)
@@ -106,7 +109,8 @@ class CellSampler:
 
 
 class Flow:
-    def __init__(self, marker):
+    def __init__(self, marker, cell_cache_size=DEFAULT_CELL_CACHE_SIZE):
+        self.cell_cache_size = cell_cache_size
         self.reader = vtk.vtkOpenFOAMReader()
         self.reader.SetFileName(str(marker))
         self.reader.SkipZeroTimeOff()
@@ -160,7 +164,7 @@ class Flow:
 
     def _sample_between(self, lower, upper, weight, xyz):
         if self.sampler is None:
-            self.sampler = CellSampler(self.field(lower))
+            self.sampler = CellSampler(self.field(lower), self.cell_cache_size)
         valid, rows, nodes, coeffs = self.sampler.stencil(xyz)
 
         def probe(i):
@@ -539,7 +543,10 @@ def run_parcels(a, flow, boundaries, seeds, releases, start):
 
 
 def run(a):
-    flow = CellPointFlow(a.case) if getattr(a, "cell_point", False) else Flow(a.case)
+    if getattr(a, "cell_point", False):
+        flow = CellPointFlow(a.case)
+    else:
+        flow = Flow(a.case, getattr(a, "cell_cache_size", DEFAULT_CELL_CACHE_SIZE))
     t = float(flow.times[0]) if a.start is None else a.start
     if not all(map(math.isfinite, [a.dt, t, a.end, a.tau, *a.gravity])) or a.dt <= 0 or a.tau < 0 or a.end <= t:
         raise ValueError("Require finite parameters, dt > 0, tau >= 0 and start < end")
@@ -677,6 +684,8 @@ if __name__ == "__main__":
     parser.add_argument("seeds", nargs="?", type=Path, help="CSV with x,y,z columns")
     parser.add_argument("output", type=Path, help="trajectory file (.csv, .vtk or .vtp), or flow CSV with --flow-only")
     parser.add_argument("--start", type=float)
+    parser.add_argument("--cell-cache-size", type=int, default=DEFAULT_CELL_CACHE_SIZE, metavar="N",
+                        help="maximum cached cell geometries for the default VTK sampler (default: %(default)s)")
     parser.add_argument("--cell-point", action="store_true",
                         help="use the v2606 exportCellPoint data in the case instead of VTK nodal U")
     parser.add_argument("--parcel-tracking", action="store_true",
@@ -708,6 +717,8 @@ if __name__ == "__main__":
     parser.add_argument("--flow-csv", type=Path, help="new CSV for injected and outlet particle rates")
     parser.add_argument("--flow-interval", type=float, help="flow averaging interval in seconds (default: dt)")
     args = parser.parse_args()
+    if args.cell_cache_size < 1:
+        parser.error("--cell-cache-size must be positive")
     if args.parcel_tracking:
         if args.diameter is None or getattr(args, "drag_model", "sphereDrag") != "sphereDrag":
             parser.error("--parcel-tracking requires --diameter and sphereDrag")
